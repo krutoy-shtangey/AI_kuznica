@@ -16,6 +16,7 @@ from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
 from backend.agent import Agent, AgentFailure, ContextMode, Model
@@ -135,6 +136,20 @@ class RequestLimits:
         await self.app(scope, replay, private_send)
 
 
+class ApiPrefix:
+    """Expose existing routes to the bundled client under /api."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith("/api/"):
+            scope = {**scope, "path": scope["path"][4:]}
+            if scope.get("raw_path", b"").startswith(b"/api/"):
+                scope["raw_path"] = scope["raw_path"][4:]
+        await self.app(scope, receive, send)
+
+
 def _bounded_env(name: str, default: int, lower: int, upper: int) -> int:
     value = int(os.environ.get(name, default))
     if not lower <= value <= upper:
@@ -147,7 +162,8 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
                demo_mode: bool = False, attempts: int = 1, per_minute: int = 12, daily_attempts: int = 80,
                retrieval_factory: Callable[[ExpertPublicationLookup], Retrieval] | None = None,
                quality_secret: str | None = None, quality_actor: str = "quality-admin",
-               mailer=None, load_quality_env: bool = False, workers: bool = True) -> FastAPI:
+               mailer=None, load_quality_env: bool = False, workers: bool = True,
+               frontend_dir: Path | None = None) -> FastAPI:
     if sum(bool(value) for value in (retrieval is not None, retrieval_factory is not None, demo_mode)) > 1:
         raise ValueError("Select only one retrieval adapter")
     if not 1 <= attempts <= 3 or min(per_minute, daily_attempts) < 1:
@@ -298,12 +314,16 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
             return _error(error.code)
         return {"dialogue_id": str(dialogue_id), "messages": turns, "next_before": cursor, "usage": totals}
 
+    if frontend_dir is not None:
+        app.add_middleware(ApiPrefix)
+        app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
     return app
 
 
 app = create_app(
     demo_mode=os.environ.get("AGENT_DEMO_MODE") == "1",
     load_quality_env=True,
+    frontend_dir=ROOT / "frontend" / "dist" if os.environ.get("AGENT_SERVE_FRONTEND") == "1" else None,
     per_minute=_bounded_env("AGENT_PER_MINUTE", 12, 1, 120),
     daily_attempts=_bounded_env("AGENT_DAILY_ATTEMPTS", 80, 1, 1000),
 )
