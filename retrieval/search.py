@@ -1,0 +1,286 @@
+"""Offline search over regulations. One instance per application, safe to share across threads."""
+import argparse
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from getpass import getpass
+import json
+from math import isfinite
+from pathlib import Path
+import re
+from threading import RLock
+from time import perf_counter
+from typing import Protocol
+
+import numpy as np
+
+from shared.contracts import RetrievalError, ScopeFilter, SearchResult, SourceStatus, SourceType
+from .bm25 import BM25
+from .embeddings import Encoder
+from .index import load_index
+
+
+@dataclass(frozen=True)
+class Settings:
+    mode: str = "hybrid"
+    cosine_floor: float = .82
+    lexical_coverage: float = .35
+    rrf_k: int = 60
+    lexical_weight: float = 1
+    semantic_weight: float = 1
+    depth: int = 32
+    context_chars: int = 6000
+    neighbors: bool = False
+
+    def __post_init__(self):
+        if (self.mode not in ("bm25", "semantic", "hybrid")
+                or not -1 <= self.cosine_floor <= 1 or not 0 <= self.lexical_coverage <= 1
+                or self.rrf_k < 0 or self.depth < 1 or self.context_chars < 1
+                or not all(isfinite(w) and w > 0 for w in (self.lexical_weight, self.semantic_weight))):
+            raise ValueError("Invalid search configuration")
+
+
+class Reranker(Protocol):
+    def score(self, question: str, passages: list[str]) -> list[float]: ...
+
+
+class LocalCrossEncoder:
+    """Optional local model. Reject overlong pairs instead of truncating them."""
+    def __init__(self, directory):
+        from sentence_transformers import CrossEncoder
+        path = Path(directory).resolve(strict=True)
+        self.model = CrossEncoder(str(path), device="cpu", local_files_only=True,
+                                  trust_remote_code=False, model_kwargs={"use_safetensors": True})
+
+    def score(self, question, passages):
+        pairs = [(question, text) for text in passages]
+        lengths = self.model.tokenizer([question] * len(pairs), passages, truncation=False,
+                                       verbose=False, return_length=True)["length"]
+        if max(lengths) > self.model.max_length:
+            raise ValueError("Reranker pair exceeds model input limit")
+        return self.model.predict(pairs, show_progress_bar=False).tolist()
+
+
+def fuse(rankings, k):
+    result = defaultdict(float)
+    for weight, ranking in rankings:
+        for rank, row in enumerate(dict.fromkeys(ranking), 1):
+            result[row] += weight / (k + rank)
+    return dict(result)
+
+
+def scope(value):
+    if value is None:
+        return ()
+    values = (value,) if isinstance(value, str) else value
+    if not isinstance(values, tuple) or not values or not all(isinstance(v, str) and v.strip() for v in values):
+        raise ValueError("Expected an ID or a nonempty tuple of IDs")
+    return values
+
+
+REFERENCE = re.compile(r"\b(?:пункт(?:а|е|у)?|подпункт(?:а|е|у)?|пп?\.?)\s*(\d+(?:\.\d+)*)", re.I)
+CONDITION = re.compile(r"\b(если|кроме|исключени\w*|при условии|запрещ\w*|нельзя|только)\b", re.I)
+
+
+@dataclass
+class Timings:
+    embedding_ms: float = 0
+    bm25_ms: float = 0
+    semantic_ms: float = 0
+    fusion_ms: float = 0
+    reranking_ms: float = 0
+    total_ms: float = 0
+    returned: int = 0
+    context_chars: int = 0
+
+
+def ms(start):
+    return (perf_counter() - start) * 1000
+
+
+class RegulationSearch:
+    def __init__(self, index="data/index", settings=Settings(), *, encoder=None, aliases=None,
+                 reranker: Reranker | None = None):
+        start = perf_counter()
+        self.root, self.settings = Path(index), settings
+        self.encoder, self.aliases, self.reranker = encoder, dict(aliases or {}), reranker
+        self.owns_encoder = encoder is None
+        self.lock = RLock()
+        self.marker = None
+        self.metrics = Timings()
+        try:
+            self._refresh()
+        except Exception as exc:
+            raise RetrievalError("Cannot initialize local regulation search") from exc
+        self.cold_ms = ms(start)
+
+    def _refresh(self):
+        marker = (self.root / "CURRENT").read_bytes()
+        if marker == self.marker:
+            return
+        saved = load_index(self.root)
+        manifest = saved.manifest
+        if self.settings.mode != "bm25":
+            model_key = (manifest["model"], manifest["revision"])
+            encoder = self.encoder
+            if self.owns_encoder and (encoder is None or (encoder.model, encoder.revision) != model_key):
+                encoder = Encoder(model=model_key[0], revision=model_key[1])
+            if (encoder.model, encoder.revision, encoder.dimension) != (*model_key, manifest["dimension"]):
+                raise RetrievalError("Index requires a different query encoder")
+        lexical = BM25(saved.chunks, self.aliases) if self.settings.mode != "semantic" else None
+        positions = {(c["document_id"], c["order"]): i for i, c in enumerate(saved.chunks)}
+        self.metadata_counts = {f"missing_{key}": sum(c[key] is None for c in saved.chunks)
+                                for key in ("department", "stage")}
+        self.metadata_counts["indexed_chunks"] = len(saved.chunks)
+        if self.settings.mode != "bm25":
+            self.encoder = encoder
+        self.saved, self.lexical, self.positions, self.marker = saved, lexical, positions, marker
+
+    def search_documents(self, question: str, top_k: int = 8, department: ScopeFilter = None,
+                         stage: ScopeFilter = None) -> list[SearchResult]:
+        if not isinstance(question, str) or not question.strip() or type(top_k) is not int or top_k < 1:
+            raise ValueError("Expected a nonempty question and positive integer top_k")
+        departments, stages = scope(department), scope(stage)
+        start = perf_counter()
+        with self.lock:
+            metrics = Timings()
+            try:
+                self._refresh()
+                if self.settings.mode != "bm25" and self.encoder.count("query: " + question) > self.encoder.limit:
+                    raise LongQuery("Question exceeds E5 input limit; split it into complete questions")
+                results = self._search(question, top_k, departments, stages, metrics)
+            except LongQuery:
+                raise
+            except Exception as exc:
+                raise RetrievalError("Local regulation search failed") from exc
+            finally:
+                metrics.total_ms = ms(start)
+                self.metrics = metrics
+            return results
+
+    def _search(self, question, top_k, departments, stages, metrics):
+        chunks, cfg = self.saved.chunks, self.settings
+        refs = set(REFERENCE.findall(question))
+        allowed = {i for i, c in enumerate(chunks)
+                   if (not departments or c["department"] is None or c["department"] in departments)
+                   and (not stages or c["stage"] is None or c["stage"] in stages)
+                   and (not refs or refs.intersection({c["section"], *(s["section"] for s in c["spans"])}))}
+        if not allowed:
+            return []
+        depth = max(cfg.depth, top_k)
+        def ranked(scores):
+            return sorted(scores, key=lambda i: (-scores[i], chunks[i]["source_id"]))
+
+        rankings = []
+        if self.lexical is not None:
+            t = perf_counter()
+            scores = self.lexical.scores(question, allowed, cfg.lexical_coverage)
+            rankings.append((cfg.lexical_weight, ranked(scores)[:depth]))
+            metrics.bm25_ms = ms(t)
+        if cfg.mode != "bm25":
+            t = perf_counter()
+            query = self.encoder.encode_queries([question])[0]
+            if (query.shape != (self.encoder.dimension,) or not np.isfinite(query).all()
+                    or not np.isclose(np.linalg.norm(query), 1, atol=1e-4)):
+                raise RetrievalError("Invalid query vector")
+            metrics.embedding_ms = ms(t)
+            t = perf_counter()
+            values = self.saved.vectors @ query
+            scores = {i: float(values[i]) for i in allowed if values[i] >= cfg.cosine_floor}
+            rankings.append((cfg.semantic_weight, ranked(scores)[:depth]))
+            metrics.semantic_ms = ms(t)
+        t = perf_counter()
+        if cfg.mode == "hybrid":
+            scores = fuse(rankings, cfg.rrf_k)
+        order = ranked(scores)[:depth]
+        metrics.fusion_ms = ms(t)
+        if self.reranker and order:
+            t = perf_counter()
+            values = self.reranker.score(question, [chunks[i]["index_text"].removeprefix("passage: ") for i in order])
+            if len(values) != len(order) or not all(isfinite(v) for v in values):
+                raise RetrievalError("Invalid reranker output")
+            scores = dict(zip(order, values))
+            order = ranked(scores)
+            metrics.reranking_ms = ms(t)
+
+        # Reserve a candidate for each applicable known scope before filling spare slots.
+        first = {}
+        for i in order:
+            c = chunks[i]
+            key = (c["department"], c["stage"])
+            first.setdefault(key, i)
+        priority = list(dict.fromkeys([*first.values(), *order]))
+        chosen = {}
+        def include(i, score):
+            size = len(chunks[i]["text"])
+            if i not in chosen and len(chosen) < top_k and metrics.context_chars + size <= cfg.context_chars:
+                chosen[i] = score
+                metrics.context_chars += size
+                return True
+            return False
+        for i in priority:
+            include(i, scores[i])
+        if cfg.neighbors:
+            for i in list(chosen):
+                c = chunks[i]
+                for delta in (-1, 1):
+                    j = self.positions.get((c["document_id"], c["order"] + delta))
+                    if j in allowed:
+                        n = chunks[j]
+                        if (n["headings"] == c["headings"] and n["section"] == c["section"]
+                                and CONDITION.search(n["text"])):
+                            include(j, min(chosen.values()))
+        results = []
+        for i in ranked(chosen):
+            c = chunks[i]
+            results.append(SearchResult(source_id=c["source_id"], document_id=c["document_id"],
+                                        source_type=SourceType(c["source_type"]), status=SourceStatus(c["status"]),
+                                        document=c["document"], text=c["text"], section=c["section"],
+                                        department=c["department"], stage=c["stage"], score=float(chosen[i]),
+                                        source_url=c.get("source_url")))
+        metrics.returned = len(results)
+        return results
+
+
+class LongQuery(ValueError):
+    """Caller can split a question without losing terms to model truncation."""
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--index", type=Path, default=Path("data/index"))
+    parser.add_argument("--mode", choices=("hybrid", "bm25", "semantic"), default="hybrid")
+    parser.add_argument("--department", action="append")
+    parser.add_argument("--stage", action="append")
+    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--context-chars", type=int, default=6000)
+    parser.add_argument("--cosine-floor", type=float, default=Settings.cosine_floor)
+    parser.add_argument("--lexical-coverage", type=float, default=Settings.lexical_coverage)
+    parser.add_argument("--show", action="store_true", help="display source text locally")
+    parser.add_argument("--neighbors", action="store_true")
+    parser.add_argument("--aliases", type=Path, help="local JSON object mapping approved variants to terms")
+    args = parser.parse_args()
+    try:
+        aliases = json.loads(args.aliases.read_text(encoding="utf-8-sig")) if args.aliases else {}
+        if not isinstance(aliases, dict) or not all(isinstance(v, str) and v.strip() for v in aliases.values()):
+            raise ValueError("Invalid alias dictionary")
+        settings = Settings(mode=args.mode, context_chars=args.context_chars, neighbors=args.neighbors,
+                            cosine_floor=args.cosine_floor, lexical_coverage=args.lexical_coverage)
+        search = RegulationSearch(args.index, settings, aliases=aliases)
+        items = search.search_documents(getpass("Вопрос: "), args.top_k, tuple(args.department or ()) or None,
+                                        tuple(args.stage or ()) or None)
+        output = dict(**asdict(search.metrics), **search.metadata_counts, cold_ms=search.cold_ms)
+        if args.show:
+            output["results"] = [asdict(item) for item in items]
+        print(json.dumps(output, ensure_ascii=False))
+        return 0
+    except LongQuery:
+        print('{"error":"query_too_long"}')
+    except RetrievalError:
+        print('{"error":"retrieval_unavailable"}')
+    except (ValueError, OSError, EOFError):
+        print('{"error":"invalid_input"}')
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
