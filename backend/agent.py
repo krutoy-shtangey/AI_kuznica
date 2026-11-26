@@ -137,6 +137,7 @@ class Excerpt:
             "revision": hit.expert_metadata.revision if hit.expert_metadata else None,
             "approved_at": hit.expert_metadata.approved_at.isoformat() if hit.expert_metadata else None,
             "appeal_id": hit.expert_metadata.appeal_id if hit.expert_metadata else None,
+            "conditions": hit.expert_metadata.scope.conditions if hit.expert_metadata else None,
         }
 
 
