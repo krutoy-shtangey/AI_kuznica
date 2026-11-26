@@ -75,6 +75,9 @@ class Store:
                     metrics TEXT, error TEXT
                 );
                 CREATE INDEX IF NOT EXISTS turns_dialogue ON turns(dialogue_id, id);
+                CREATE TABLE IF NOT EXISTS turn_appeal_context (
+                    turn_id INTEGER PRIMARY KEY REFERENCES turns(id), snapshot TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS activity (
                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, instant REAL NOT NULL, attempts INTEGER NOT NULL
                 );
@@ -142,7 +145,7 @@ class Store:
                        (lease, now + self.lease_seconds, dialogue_id))
             return lease, DialogueState.load(json.loads(row["state"]))
 
-    def finish(self, dialogue_id, lease, message, *, outcome=None, error=None) -> dict:
+    def finish(self, dialogue_id, lease, message, *, outcome=None, error=None) -> tuple[int, dict]:
         result = asdict(outcome.result) if outcome is not None else None
         sources = outcome.sources if outcome is not None else ()
         metrics_object = outcome.metrics if outcome is not None else error.metrics
@@ -152,14 +155,23 @@ class Store:
             if row is None:
                 raise AccessError("dialogue_busy")
             state = dump(asdict(outcome.state)) if outcome is not None else row["state"]
-            db.execute("INSERT INTO turns(dialogue_id, message, result, sources, metrics, error) VALUES (?, ?, ?, ?, ?, ?)",
-                       (dialogue_id, message, dump(result), dump(sources), dump(metrics), error.code if error else None))
+            turn_id = db.execute(
+                "INSERT INTO turns(dialogue_id,message,result,sources,metrics,error) VALUES (?,?,?,?,?,?)",
+                (dialogue_id, message, dump(result), dump(sources), dump(metrics), error.code if error else None),
+            ).lastrowid
+            if outcome is not None and result["result_type"] in {"NO_ANSWER", "CONFLICT"}:
+                context = outcome.state
+                db.execute("INSERT INTO turn_appeal_context VALUES (?,?)", (turn_id, dump({
+                    "question": context.question or message, "original_question": context.original or message,
+                    "clarifications": context.refinements, "department": context.department, "stage": context.stage,
+                    "facts": context.facts, "considered_source_ids": outcome.considered,
+                })))
             db.execute("UPDATE dialogues SET state=?, lease_id=NULL, lease_until=NULL WHERE id=?", (state, dialogue_id))
             # Unexpected failures may have called a provider without returning metrics. Keep their reservation.
             if error is None or metrics is not None or error.code != "internal_error":
                 db.execute("UPDATE activity SET attempts=? WHERE id=?",
                            (metrics_object.attempt_count if metrics_object else 0, lease))
-            return self._usage(db, dialogue_id)
+            return turn_id, self._usage(db, dialogue_id)
 
     @staticmethod
     def _usage(db, dialogue_id):
