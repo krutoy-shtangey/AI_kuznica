@@ -2,11 +2,12 @@
 
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.evidence import conditions_map, context_terms, evidence_window
 from backend.llm import CallMetrics, LLMError, LLMResult
 from shared.contracts import (
     AgentResult, AgentResultType, ExpertPublicationLookup, Retrieval, RetrievalError,
@@ -27,6 +28,7 @@ STAGES = {
 MAX_CLARIFICATIONS = 3
 MAX_SOURCES = 8
 MAX_EXCERPT = 1400
+CONTEXT_BUDGET = 8400
 MAX_SEARCH = 3500
 
 SYSTEM_PROMPT = """Ты выбираешь доказательства для корпоративного помощника. Верни только JSON.
@@ -48,6 +50,8 @@ CONFLICT: если два пункта в одной области дают р�
 вопрос, верни CONFLICT даже при разнице лишь в ответственном исполнителе или сроке.
 В evidence укажи два разных source_id и две дословные цитаты. question и field опусти
 или задай null. Если различие вызвано подразделением или этапом, задай CLARIFY.
+Разъяснение службы качества не отменяет регламент. При несовместимости выбери CONFLICT и процитируй оба.
+Если разъяснение дополняет относящийся к вопросу пункт регламента, процитируй оба.
 NO_ANSWER: если ответ можно лишь предположить, evidence — пустой список.
 Вне CLARIFY поля field и question — null. Учитывай именно текущий вопрос.
 """
@@ -82,6 +86,7 @@ class AgentFailure(Exception):
 class Pending:
     field: str
     question: str
+    fact_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,7 @@ class DialogueState:
     refinements: tuple[str, ...] = ()
     asked: tuple[str, ...] = ()
     pending: Pending | None = None
+    facts: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, value: dict) -> "DialogueState":
@@ -110,12 +116,14 @@ class Outcome:
     state: DialogueState
     sources: tuple[dict, ...] = ()
     metrics: CallMetrics | None = None
+    considered: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class Excerpt:
     source: SearchResult
     text: str
+    offset: int = 0
 
     def public(self) -> dict:
         hit = self.source
@@ -124,7 +132,11 @@ class Excerpt:
             "document_id": hit.document_id, "document": hit.document, "section": hit.section,
             "department": hit.department, "stage": hit.stage, "status": hit.status,
             "source_url": hit.source_url, "excerpt": self.text,
+            "excerpt_start": self.offset, "excerpt_end": self.offset + len(self.text),
+            "excerpt_partial": self.text != hit.text,
             "revision": hit.expert_metadata.revision if hit.expert_metadata else None,
+            "approved_at": hit.expert_metadata.approved_at.isoformat() if hit.expert_metadata else None,
+            "appeal_id": hit.expert_metadata.appeal_id if hit.expert_metadata else None,
         }
 
 
@@ -155,7 +167,10 @@ def _context(previous: DialogueState, message: str, mode: ContextMode):
         refinements = previous.refinements
         if _fingerprint(message) not in {_fingerprint(item) for item in refinements}:
             refinements = (*refinements, message)[-MAX_CLARIFICATIONS:]
-        state = replace(previous, refinements=refinements, pending=None)
+        facts = previous.facts.copy()
+        if previous.pending.fact_key and len(message.strip()) <= 80 and "=" not in message:
+            facts[previous.pending.fact_key] = message.strip().rstrip(".").casefold()
+        state = replace(previous, refinements=refinements, pending=None, facts=facts)
     elif follow_up and previous.question:
         state = replace(previous, previous_question=previous.question, question=message, pending=None, asked=())
     else:
@@ -165,6 +180,16 @@ def _context(previous: DialogueState, message: str, mode: ContextMode):
         state = replace(state, department=departments[0] if len(departments) == 1 else None)
     if stages:
         state = replace(state, stage=stages[0] if len(stages) == 1 else None)
+    # Explicit facts may be provided in a separate key=value line.
+    supplied = {}
+    for line in message.splitlines()[:5]:
+        if "=" in line:
+            try:
+                supplied.update(conditions_map(line))
+            except ValueError:
+                continue
+    if supplied:
+        state = replace(state, facts=dict(list((state.facts | supplied).items())[-8:]))
     return state, departments or state.department, stages or state.stage
 
 
@@ -185,15 +210,16 @@ class Agent:
         query = "\n".join(dict.fromkeys(filter(None, (
             state.question, state.original, state.previous_question, *state.refinements, state.department, state.stage,
         ))))[:MAX_SEARCH]
-        excerpts = self._fetch(query, departments, stages)
+        excerpts, considered, missing = self._fetch(query, departments, stages, state)
         if not excerpts:
-            return self._no_answer(dialogue_id, state)
+            result = self._ask_condition(dialogue_id, state, missing) if missing else self._no_answer(dialogue_id, state)
+            return replace(result, considered=considered)
 
         payload = json.dumps({
             "question": state.question, "previous_subject": state.original if state.original != state.question else None,
             "previous_question": state.previous_question,
             "confirmed_department": state.department, "confirmed_stage": state.stage,
-            "clarifications": state.refinements, "already_asked": state.asked, "sources": [
+            "clarifications": state.refinements, "confirmed_facts": state.facts, "already_asked": state.asked, "sources": [
                 {key: value for key, value in excerpt.public().items() if key not in {"source_url", "revision"}}
                 for excerpt in excerpts.values()
             ],
@@ -207,11 +233,14 @@ class Agent:
             } else "model_invalid_response", error.metrics) from None
 
         try:
-            return self._validate(dialogue_id, state, excerpts, reply.value, reply.metrics)
+            result = self._validate(dialogue_id, state, excerpts, reply.value, reply.metrics)
+            if result.result.result_type is AgentResultType.NO_ANSWER and missing:
+                result = self._ask_condition(dialogue_id, state, missing, reply.metrics)
+            return replace(result, considered=considered)
         except AgentFailure as error:
             raise AgentFailure(error.code, reply.metrics) from None
 
-    def _fetch(self, query, department, stage) -> dict[str, Excerpt]:
+    def _fetch(self, query, department, stage, state: DialogueState):
         try:
             # Probe known alternatives separately so a single area cannot occupy all slots.
             departments = department if isinstance(department, tuple) else (department,)
@@ -231,7 +260,7 @@ class Agent:
                 continue
             if hit.source_type is SourceType.EXPERT_ANSWER and (
                 hit.status is not SourceStatus.APPROVED or not hit.expert_metadata
-                or hit.expert_metadata.revision < 1 or hit.expert_metadata.scope.conditions
+                or hit.expert_metadata.revision < 1
                 or (hit.department, hit.stage) != (
                     hit.expert_metadata.scope.department, hit.expert_metadata.scope.stage
                 )
@@ -248,7 +277,8 @@ class Agent:
         published = self._published(tuple(
             hit.source_id for hit in unique.values() if hit.source_type is SourceType.EXPERT_ANSWER
         ))
-        selected = {}
+        selected, considered, missing = {}, [], []
+        budget = CONTEXT_BUDGET
         # Interleave scopes first when separate probes provide candidates across several areas.
         ordered = sorted(unique.values(), key=lambda hit: -hit.score) if len(departments) * len(stages) == 1 else unique.values()
         if len(departments) * len(stages) > 1:
@@ -259,14 +289,41 @@ class Agent:
         for hit in ordered:
             if hit.source_type is SourceType.EXPERT_ANSWER and published.get(hit.source_id) != hit.expert_metadata.revision:
                 continue
-            text = hit.text.strip()
-            if len(text) > MAX_EXCERPT:
-                # Keep the complete indexed provision or omit it.
+            considered.append(hit.source_id)
+            if hit.expert_metadata:
+                try:
+                    conditions = conditions_map(hit.expert_metadata.scope.conditions)
+                except ValueError:
+                    continue
+                if any(key in state.facts and state.facts[key] != value for key, value in conditions.items()):
+                    continue
+                absent = next((key for key in conditions if key not in state.facts), None)
+                if hit.department and not state.department:
+                    missing.append(("department", hit.department))
+                    continue
+                if hit.stage and not state.stage:
+                    missing.append(("stage", hit.stage))
+                    continue
+                if absent:
+                    missing.append(("fact", absent))
+                    continue
+            if len(selected) == MAX_SOURCES or budget < 180:
                 continue
-            selected[hit.source_id] = Excerpt(hit, text)
-            if len(selected) == MAX_SOURCES:
-                break
-        return selected
+            window = evidence_window(hit.text, query, min(MAX_EXCERPT, budget))
+            if window is None:
+                continue
+            text, offset = window
+            selected[hit.source_id] = Excerpt(hit, text, offset)
+            budget -= len(text)
+        return selected, tuple(considered), missing
+
+    def _ask_condition(self, dialogue_id, state, missing, metrics=None):
+        field, value = missing[0]
+        if field != "fact":
+            options = {candidate for part, candidate in missing if part == field}
+            return self._clarify(dialogue_id, state, field, _scope_question(field, options), metrics)
+        return self._clarify(dialogue_id, state, "other",
+                             f"Уточните значение параметра «{value}»?", metrics, fact_key=value)
 
     def _published(self, source_ids: tuple[str, ...]) -> dict[str, int]:
         if not source_ids or self.publications is None:
@@ -289,7 +346,7 @@ class Agent:
         quotes = set()
         for entry in draft.evidence:
             excerpt = excerpts.get(entry.source_id)
-            if excerpt is None or not entry.quote.strip() or entry.quote not in excerpt.text:
+            if excerpt is None or not entry.quote.strip() or entry.quote not in excerpt.text or entry.quote not in excerpt.source.text:
                 raise AgentFailure("evidence_invalid")
             selected[entry.source_id] = excerpt
             quotes.add(_fingerprint(entry.quote))
@@ -329,6 +386,19 @@ class Agent:
             if not getattr(state, field) and cited and len(candidates) > 1:
                 return self._clarify(dialogue_id, state, field, _scope_question(field, candidates), metrics)
 
+        # A matching official provision cannot be silently bypassed by choosing only an explanation.
+        if kind is AgentResultType.ANSWER and all(
+            item.source.source_type is SourceType.EXPERT_ANSWER for item in selected.values()
+        ):
+            question_terms = context_terms(state.question or "")
+            expert_terms = set().union(*(context_terms(item.text) for item in selected.values()))
+            if any(
+                item.source.source_type is SourceType.REGULATION
+                and len(context_terms(item.text) & question_terms & expert_terms) >= 2
+                for item in excerpts.values()
+            ):
+                raise AgentFailure("source_review_required")
+
         sources = tuple(item.public() for item in selected.values())
         if not self.published_sources(sources):
             raise AgentFailure("source_changed")
@@ -337,9 +407,11 @@ class Agent:
             hit = excerpt.source
             label = f"{hit.document}, п. {hit.section}" if hit.section else hit.document
             if hit.source_type is SourceType.EXPERT_ANSWER:
-                label = f"Разъяснение службы качества — {label}"
+                meta = hit.expert_metadata
+                label = f"Разъяснение службы качества {hit.source_id}, утверждено {meta.approved_at.date().isoformat()}"
             note = "\nАктуальность документа не подтверждена." if hit.status is SourceStatus.UNKNOWN else ""
-            passages.append(f"{label}\n«{excerpt.text}»{note}")
+            partial = "\nПоказан фрагмент пункта." if excerpt.text != hit.text else ""
+            passages.append(f"{label}\n«{excerpt.text}»{note}{partial}")
         text = "\n\n".join(passages)
         if kind is AgentResultType.CONFLICT:
             text = "Найдено расхождение между положениями. Обратитесь в службу качества.\n\n" + text
@@ -353,12 +425,12 @@ class Agent:
             replace(state, pending=None), metrics=metrics,
         )
 
-    def _clarify(self, dialogue_id, state, field, question, metrics):
+    def _clarify(self, dialogue_id, state, field, question, metrics, *, fact_key=None):
         fingerprint = _fingerprint(question)
         if len(state.asked) >= MAX_CLARIFICATIONS or fingerprint in {_fingerprint(old) for old in state.asked}:
             return self._no_answer(dialogue_id, state, metrics)
         return Outcome(
             AgentResult(AgentResultType.CLARIFY, dialogue_id, clarification_question=question),
-            replace(state, pending=Pending(field, question), asked=(*state.asked, question)),
+            replace(state, pending=Pending(field, question, fact_key), asked=(*state.asked, question)),
             metrics=metrics,
         )

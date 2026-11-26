@@ -1,24 +1,29 @@
 """Minimal FastAPI entry point for an explicitly configured retrieval adapter."""
 
+import asyncio
 import json
 import os
 import sqlite3
 from contextlib import asynccontextmanager, closing
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Callable
 from urllib.parse import urlsplit
 from uuid import UUID
 
+from dotenv import dotenv_values
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, StringConstraints
 
 from backend.agent import Agent, AgentFailure, ContextMode, Model
 from backend.demo_retrieval import DemoRetrieval
 from backend.llm import LLMClient, LLMSettings
+from backend.quality import Quality
+from backend.quality_api import routes as quality_routes
+from backend.quality_mail import SMTPMailer, SMTPSettings, deliver_one
 from backend.storage import AccessError, Store, dump, summarize
 from shared.contracts import AgentResult, ExpertPublicationLookup, Retrieval
 
@@ -39,9 +44,19 @@ _ERRORS = {
     "source_changed": (409, "Источник изменился. Повторите вопрос."),
     "source_inconsistent": (502, "Поиск вернул разные версии одного источника."),
     "evidence_invalid": (502, "Ответ модели не удалось подтвердить по источникам."),
+    "source_review_required": (502, "Не удалось сверить разъяснение с найденным регламентом. Обратитесь в службу качества."),
     "model_invalid_response": (502, "Модель вернула непригодный результат."),
     "storage_unavailable": (503, "Хранилище диалогов временно недоступно."),
     "internal_error": (500, "Внутренняя ошибка обработки запроса."),
+    "appeal_ineligible": (409, "Обращение можно создать только после ответа об отсутствии данных или противоречии."),
+    "appeal_not_found": (404, "Обращение не найдено."),
+    "appeal_changed": (409, "Карточка изменилась. Загрузите текущую версию."),
+    "appeal_transition": (409, "Действие недоступно для текущего состояния обращения."),
+    "appeal_rate_limit": (429, "Достигнут лимит регистрации обращений."),
+    "quality_disabled": (503, "Доступ к службе качества не настроен."),
+    "quality_unauthorized": (401, "Требуется административный токен."),
+    "quality_login_limit": (429, "Превышен лимит попыток входа."),
+
 }
 
 
@@ -57,6 +72,7 @@ class DialogueCreated(BaseModel):
 
 
 class MessageReply(BaseModel):
+    turn_id: int
     result: AgentResult
     sources: list[dict]
     metrics: dict
@@ -87,11 +103,11 @@ class RequestLimits:
 
         async def private_send(event):
             if event["type"] == "http.response.start":
-                event["headers"] = [*event.get("headers", []), (b"x-robots-tag", b"noindex"),
+                event["headers"] = [*event.get("headers", []), (b"x-robots-tag", b"noindex, nofollow"),
                                     (b"cache-control", b"no-store"), (b"x-agent-mode", self.mode)]
             await send(event)
 
-        if scope["method"] != "POST":
+        if scope["method"] not in {"POST", "PUT", "PATCH"}:
             await self.app(scope, receive, private_send)
             return
         body = bytearray()
@@ -128,8 +144,11 @@ def _bounded_env(name: str, default: int, lower: int, upper: int) -> int:
 
 def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None,
                publications: ExpertPublicationLookup | None = None, db_path: Path | None = None,
-               demo_mode: bool = False, attempts: int = 1, per_minute: int = 12, daily_attempts: int = 80) -> FastAPI:
-    if retrieval is not None and demo_mode:
+               demo_mode: bool = False, attempts: int = 1, per_minute: int = 12, daily_attempts: int = 80,
+               retrieval_factory: Callable[[ExpertPublicationLookup], Retrieval] | None = None,
+               quality_secret: str | None = None, quality_actor: str = "quality-admin",
+               mailer=None, load_quality_env: bool = False, workers: bool = True) -> FastAPI:
+    if sum(bool(value) for value in (retrieval is not None, retrieval_factory is not None, demo_mode)) > 1:
         raise ValueError("Select only one retrieval adapter")
     if not 1 <= attempts <= 3 or min(per_minute, daily_attempts) < 1:
         raise ValueError("Invalid limits")
@@ -138,14 +157,49 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
             raise ValueError("The injected LLM exceeds the reserved attempt limit")
         if not demo_mode and urlsplit(model.settings.base_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
             raise ValueError("Corporate retrieval requires a local endpoint in this server configuration.")
-    if demo_mode:
-        retrieval = DemoRetrieval()
     default_db = "demo.sqlite3" if demo_mode else "agent.sqlite3"
     store = Store(db_path or ROOT / "storage" / default_db, per_minute=per_minute, daily_attempts=daily_attempts)
+
+    mail_status = "disabled"
+    if load_quality_env:
+        config = {**dotenv_values(ROOT / ".env", interpolate=False), **os.environ}
+        quality_secret = config.get("QUALITY_ADMIN_SECRET")
+        quality_actor = config.get("QUALITY_ADMIN_NAME") or quality_actor
+        try:
+            smtp = SMTPSettings.load(config)
+        except ValueError:
+            smtp = None
+            mail_status = "not_configured"
+        mailer = SMTPMailer(smtp) if smtp else None
+    quality = Quality(store, retrieval, mailer, mail_status=mail_status)
+    if demo_mode:
+        retrieval = DemoRetrieval(store, quality)
+    elif retrieval_factory:
+        retrieval = retrieval_factory(quality)
+    quality.retrieval = retrieval
+
+    def process_queue():
+        # Outboxes are independent: one failed operation cannot block the other.
+        for job in (quality.process_index, lambda: deliver_one(quality)):
+            try:
+                job()
+            except (sqlite3.Error, OSError):
+                continue
+
+    async def run_queue(stop):
+        while not stop.is_set():
+            await asyncio.to_thread(process_queue)
+            try:
+                await asyncio.wait_for(stop.wait(), 2)
+            except TimeoutError:
+                pass
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store.initialize()
+        quality.initialize()
+        if demo_mode:
+            retrieval.initialize()
         active_model = model
         owned_model = None
         if retrieval is not None and active_model is None:
@@ -156,16 +210,27 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
                 replace(settings, max_tokens=min(settings.max_tokens, 512), timeout=min(settings.timeout, 40)),
                 max_attempts=attempts,
             )
-        app.state.agent = Agent(retrieval, active_model, publications) if retrieval and active_model else None
+        app.state.agent = Agent(retrieval, active_model, publications or quality) if retrieval and active_model else None
+        app.state.quality = quality
+        stop = asyncio.Event()
+        task = asyncio.create_task(run_queue(stop)) if workers else None
         try:
             yield
         finally:
+            stop.set()
+            if task is not None:
+                await task
             if owned_model is not None:
                 owned_model.close()
 
     app = FastAPI(title="ИИКузница", version="0.1.0", lifespan=lifespan)
     mode = "demo" if demo_mode else "configured" if retrieval is not None else "disabled"
     app.add_middleware(RequestLimits, mode=mode.encode("ascii"))
+    app.include_router(quality_routes(quality, _token, quality_secret, quality_actor))
+
+    @app.get("/robots.txt", response_class=PlainTextResponse, include_in_schema=False)
+    def robots():
+        return "User-agent: *\nDisallow: /\n"
 
     @app.exception_handler(AccessError)
     async def access_error(_request: Request, error: AccessError):
@@ -200,7 +265,7 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
         try:
             outcome = agent.reply(dialogue_id, previous, body.message, body.context)
         except AgentFailure as error:
-            totals = store.finish(dialogue_id, lease, body.message, error=error)
+            _, totals = store.finish(dialogue_id, lease, body.message, error=error)
             measures = asdict(error.metrics) if error.metrics else None
             return _error(error.code, metrics=json.loads(dump({
                 "call": measures, "totals": summarize([measures]),
@@ -210,10 +275,10 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
             store.finish(dialogue_id, lease, body.message, error=AgentFailure("internal_error"))
             return _error("internal_error")
 
-        totals = store.finish(dialogue_id, lease, body.message, outcome=outcome)
+        turn_id, totals = store.finish(dialogue_id, lease, body.message, outcome=outcome)
         measures = asdict(outcome.metrics) if outcome.metrics else None
         return {
-            "result": outcome.result, "sources": list(outcome.sources),
+            "turn_id": turn_id, "result": outcome.result, "sources": list(outcome.sources),
             "metrics": {"call": measures, "totals": summarize([measures])}, "dialogue_usage": totals,
         }
 
@@ -238,6 +303,7 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
 
 app = create_app(
     demo_mode=os.environ.get("AGENT_DEMO_MODE") == "1",
+    load_quality_env=True,
     per_minute=_bounded_env("AGENT_PER_MINUTE", 12, 1, 120),
     daily_attempts=_bounded_env("AGENT_DAILY_ATTEMPTS", 80, 1, 1000),
 )

@@ -310,7 +310,7 @@ class APIAgentTests(unittest.TestCase):
         client, _, model = self.launch([TECH_IMPL], draft("ANSWER", TECH_IMPL), daily_attempts=1)
         self.assertEqual(client.get("/health").json()["retrieval"], "configured")
         self.assertEqual(client.get("/docs").status_code, 200)
-        self.assertEqual(client.get("/openapi.json").headers["x-robots-tag"], "noindex")
+        self.assertEqual(client.get("/openapi.json").headers["x-robots-tag"], "noindex, nofollow")
         path, bearer = self.dialogue(client)
         self.assertEqual(client.post(path, headers=bearer, json={"message": "x" * 2001}).status_code, 422)
         self.assertEqual(client.post(path, headers=bearer, content=b"x" * 20000).status_code, 413)
