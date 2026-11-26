@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import re
+import stat
 from io import BytesIO
 from itertools import count
 from pathlib import Path
@@ -115,7 +116,7 @@ class Reader:
         element.shape = len(table.rows), len(table.columns)
 
 
-def load_directory(directory, *, document_ids=None, scopes=None, statuses=None):
+def load_directory(directory, *, document_ids=None, scopes=None, statuses=None, known_checksums=None):
     """Mappings keyed by exact filename may supply verified metadata from the caller."""
     batch = Batch()
     seen = set()
@@ -126,7 +127,7 @@ def load_directory(directory, *, document_ids=None, scopes=None, statuses=None):
         return batch
     for path in paths:
         try:
-            if path.name.startswith("~$") or path.is_symlink() or not path.is_file():
+            if path.name.startswith("~$") or not stat.S_ISREG(path.lstat().st_mode):
                 continue
             if path.suffix.lower() != ".docx":
                 batch.unsupported += 1
@@ -141,6 +142,10 @@ def load_directory(directory, *, document_ids=None, scopes=None, statuses=None):
             meta = Metadata(identifier, path.name, checksum,
                             (scopes or {}).get(path.name, ApplicabilityScope()),
                             (statuses or {}).get(path.name, SourceStatus.UNKNOWN))
+            if known_checksums and known_checksums.get(identifier) == checksum:
+                batch.reused.append(meta)
+                seen.add(checksum)
+                continue
             document = Document(BytesIO(data))
             reader = Reader(document, meta)
             blocks = reader.blocks(document.element.body, document)

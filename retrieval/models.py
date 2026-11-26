@@ -57,6 +57,7 @@ class Batch:
     duplicates: int = 0
     unsupported: int = 0
     errors: int = 0
+    reused: list[Metadata] = field(default_factory=list)
 
     def statistics(self):
         paragraphs = tables = 0
