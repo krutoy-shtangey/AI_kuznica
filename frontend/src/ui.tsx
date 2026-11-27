@@ -1,4 +1,4 @@
-import { ArrowUpRight, CircleAlert, FileText, ShieldCheck } from 'lucide-react'
+import { ArrowUpRight, ChevronDown, CircleAlert, FileText, Layers3, ShieldCheck } from 'lucide-react'
 import type { ReactNode } from 'react'
 import type { Source, Usage } from './api'
 
@@ -38,30 +38,46 @@ export function Notice({ children, tone = 'neutral' }: { children: ReactNode; to
   </div>
 }
 
+export function BrandMark({ small = false }: { small?: boolean }) {
+  return <span className={small ? 'brand-mark small' : 'brand-mark'} aria-hidden="true">
+    <Layers3 size={small ? 16 : 22} strokeWidth={1.8} />
+  </span>
+}
+
 export function SourceCard({ source }: { source: Source }) {
   const expert = source.source_type === 'expert_answer'
   const Icon = expert ? ShieldCheck : FileText
   const link = source.source_url && /^https?:\/\//i.test(source.source_url) ? source.source_url : null
-  return <article className={'source-card' + (expert ? ' expert' : '')}>
-    <div className="source-top"><span className="source-icon"><Icon size={17} /></span>
-      <div><small>{expert ? 'Разъяснение службы качества' : 'Регламент'}</small><strong>{source.document}</strong></div>
-      {link && <a className="icon-button" href={link} target="_blank" rel="noopener noreferrer" aria-label="Открыть источник"><ArrowUpRight size={17} /></a>}
+  const metadata = [
+    ['Подразделение', source.department && statusText(departments, source.department)],
+    ['Этап', source.stage && statusText(stages, source.stage)],
+    ['Условия', source.conditions],
+    ['Дата утверждения', expert && source.approved_at && formatDate(source.approved_at)],
+    ['Номер', expert && (source.appeal_id ?? source.source_id)],
+    ['Редакция', expert && source.revision],
+    ['Статус', source.status === 'approved' && (expert ? 'Утверждено' : 'Актуальность подтверждена')],
+  ] as const
+  return <details className={'source-card' + (expert ? ' expert' : '')}>
+    <summary className="source-top">
+      <span className="source-icon"><Icon size={17} /></span>
+      <span className="source-label">
+        {expert && <small>Разъяснение службы качества</small>}
+        <strong>{source.document}</strong>
+        <span className="source-subline">
+          {source.section && <span>Пункт {source.section}</span>}
+          {source.status === 'unknown' && <span className="source-warning">Актуальность не подтверждена</span>}
+        </span>
+      </span>
+      <ChevronDown className="source-chevron" size={16} aria-hidden="true" />
+    </summary>
+    <div className="source-body">
+      <blockquote>{source.excerpt}</blockquote>
+      {source.excerpt_partial && <small className="muted">Показан фрагмент пункта</small>}
+      <dl className="source-meta">{metadata.map(([label, value]) => value ?
+        <div key={label}><dt>{label}</dt><dd>{value}</dd></div> : null)}</dl>
+      {link && <a className="source-link" href={link} target="_blank" rel="noopener noreferrer">Открыть источник <ArrowUpRight size={15} /></a>}
     </div>
-    <div className="chips">
-      {source.section && <span>Пункт {source.section}</span>}
-      {source.department && <span>{statusText(departments, source.department)}</span>}
-      {source.stage && <span>{statusText(stages, source.stage)}</span>}
-      {source.status === 'unknown' && <span className="warning-chip">Актуальность не подтверждена</span>}
-      {source.status === 'approved' && <span className="green-chip">{expert ? 'Утверждено' : 'Актуальность подтверждена'}</span>}
-    </div>
-    <blockquote>{source.excerpt}</blockquote>
-    {expert && <div className="source-meta">
-      <span>Утверждено {formatDate(source.approved_at)}</span>
-      {source.conditions && <span>Условия: {source.conditions}</span>}
-      <span>Номер: {source.appeal_id ?? source.source_id}</span>
-    </div>}
-    {source.excerpt_partial && <small className="muted">Показан фрагмент пункта</small>}
-  </article>
+  </details>
 }
 
 function costText(cost: Usage['provider_cost']) {

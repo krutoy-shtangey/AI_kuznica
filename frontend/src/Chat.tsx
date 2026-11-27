@@ -1,9 +1,9 @@
-import { ArrowRight, ArrowUp, Check, ChevronDown, CircleHelp, ClipboardCopy, FileSearch, GitBranch, Inbox, LifeBuoy, LoaderCircle, MessageSquare, Send, TriangleAlert } from 'lucide-react'
+import { ArrowRight, ArrowUp, Check, ChevronDown, ClipboardCopy, FileSearch, GitBranch, Inbox, LifeBuoy, LoaderCircle, Send, TriangleAlert } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import { api } from './api'
 import type { ContextMode, Dialogue, History, Mode, PublicAppeal, Turn, Usage } from './api'
-import { delivery, errorLabels, errorText, Notice, SourceCard, statuses, statusText } from './ui'
+import { BrandMark, delivery, errorLabels, errorText, Notice, SourceCard, statuses, statusText } from './ui'
 
 const examples = [
   { icon: FileSearch, title: 'Найти порядок действий', text: 'Кто принимает опытный макет?', live: 'Какой порядок действий описан для моего этапа проекта?' },
@@ -70,6 +70,21 @@ export default function Chat({ current, mode, onCreate, onTitle, onUsage, appeal
       preserveScroll.current = null
     } else scroll.current.scrollTop = scroll.current.scrollHeight
   }, [id, last?.id, pending, turns.length, visible])
+
+  useLayoutEffect(() => {
+    const input = textarea.current
+    if (!visible || !input) return
+    function size() {
+      if (!input) return
+      input.style.height = 'auto'
+      const limit = Math.min(168, window.innerHeight * .25)
+      input.style.height = Math.min(input.scrollHeight, limit) + 'px'
+      input.style.overflowY = input.scrollHeight > limit ? 'auto' : 'hidden'
+    }
+    size()
+    window.addEventListener('resize', size)
+    return () => window.removeEventListener('resize', size)
+  }, [draft, visible])
 
   function changeDraft(text: string) {
     setDrafts((old) => ({ ...old, [id]: text }))
@@ -145,7 +160,7 @@ export default function Chat({ current, mode, onCreate, onTitle, onUsage, appeal
       {readError && <div className="chat-width top-notice"><Notice tone="error">{readError} <button className="text-button" onClick={() => setRefresh((value) => value + 1)}>Повторить</button></Notice></div>}
       {!turns.length && !pending && (!id || (history && !readError)) &&
         <div className="welcome chat-width">
-          <span className="welcome-icon"><MessageSquare size={27} strokeWidth={1.65} /></span>
+          <BrandMark />
           <h1>Вопросы по регламентам</h1>
           <p>Спросите о рабочих процедурах и получите ответ со ссылками на конкретные пункты.</p>
           <div className="examples" aria-label="Примеры вопросов">
@@ -170,7 +185,7 @@ export default function Chat({ current, mode, onCreate, onTitle, onUsage, appeal
         {sendError?.id === id && !(last?.error && last.message === sendError.submitted) && <div className="send-error"><Notice tone="error">{sendError.message}</Notice></div>}
         <form className="composer" onSubmit={(event: FormEvent) => { event.preventDefault(); if (canSend) void submit() }}>
           <label className="sr-only" htmlFor="message">Сообщение</label>
-          <textarea ref={textarea} id="message" rows={2} maxLength={2000} value={draft}
+          <textarea ref={textarea} id="message" rows={1} maxLength={2000} value={draft}
             placeholder={last?.result?.result_type === 'CLARIFY' ? 'Напишите уточнение…' : 'Задайте вопрос по регламентам…'}
             onChange={(event) => changeDraft(event.target.value)} onKeyDown={keyboard} />
           <div className="composer-actions">
@@ -179,21 +194,18 @@ export default function Chat({ current, mode, onCreate, onTitle, onUsage, appeal
                 <option value="auto">Автоконтекст</option><option value="new">Новая тема</option><option value="follow_up">Продолжить тему</option>
               </select><ChevronDown size={13} aria-hidden="true" />
             </label>
-            <div className="send-controls"><span className="counter">{draft.length} / 2000</span>
+            <div className="send-controls">{draft.length >= 1750 && <span className="counter">{draft.length} / 2000</span>}
               <button className="send-button" type="submit" disabled={!canSend} aria-label="Отправить сообщение">
                 {pending ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={20} />}
               </button></div>
           </div>
         </form>
-        <div className="composer-hint"><span>Ответы основаны на доступных источниках</span><span>Enter — отправить · Shift+Enter — перенос</span></div>
       </div>
     </div>
   </section>
 }
 
 const presentation = {
-  ANSWER: { label: 'Ответ по источникам', icon: Check },
-  CLARIFY: { label: 'Нужно уточнение', icon: CircleHelp },
   NO_ANSWER: { label: 'Недостаточно информации', icon: Inbox },
   CONFLICT: { label: 'Противоречие источников', icon: TriangleAlert },
 }
@@ -206,8 +218,8 @@ function Message({ turn, dialogue, appeal, onAppeal, choose, busy }: {
   const [copied, setCopied] = useState(false)
   const result = turn.result
   const eligible = result?.result_type === 'NO_ANSWER' || result?.result_type === 'CONFLICT'
-  const meta = result && presentation[result.result_type]
-  const Icon = meta?.icon ?? CircleHelp
+  const meta = eligible ? presentation[result.result_type as keyof typeof presentation] : null
+  const Icon = meta?.icon
   const text = result?.result_type === 'CLARIFY' ? result.clarification_question : result?.text
   const renderedBySources = result?.result_type === 'ANSWER' && turn.sources.length
     && (text?.startsWith(turn.sources[0].document) || text?.startsWith('Разъяснение службы качества '))
@@ -242,21 +254,28 @@ function Message({ turn, dialogue, appeal, onAppeal, choose, busy }: {
   return <div className="message-pair">
     <div className="user-message">{turn.message}</div>
     {turn.error && <Notice tone="error">{errorLabels[turn.error] ?? 'Запрос завершился технической ошибкой.'}</Notice>}
-    {!turn.error && result && <article className={'agent-message ' + result.result_type.toLowerCase()}>
-      <div className="message-heading"><span className="message-type"><Icon size={17} />{meta?.label}</span>
-        {text && <button className="icon-button" onClick={() => void copy()} title={copied ? 'Скопировано' : 'Копировать ответ'}
-          aria-label={copied ? 'Скопировано' : 'Копировать ответ'}>{copied ? <Check size={16} /> : <ClipboardCopy size={16} />}</button>}
-      </div>
-      {shownText && <p className="answer-text">{shownText}</p>}
+    {!turn.error && result && <article aria-label="Ответ ассистента" className={'agent-message ' + result.result_type.toLowerCase()}>
+      <BrandMark small />
+      <div className="agent-content">
+      {meta && Icon && <div className="message-type"><Icon size={16} />{meta.label}</div>}
+      {renderedBySources
+        ? <div className="answer-text">{turn.sources.map((source) => <p key={source.source_id}>{source.excerpt}</p>)}</div>
+        : shownText && <div className="answer-text">{shownText}</div>}
       {result.result_type === 'CLARIFY' && !!result.clarification_options?.length &&
         <div className="button-row">{result.clarification_options.map((option) => <button key={option} className="button" disabled={busy} onClick={() => choose(option)}>{option}</button>)}</div>}
-      {!!turn.sources.length && <div className="message-sources">{turn.sources.map((source) => <SourceCard key={source.source_id} source={source} />)}</div>}
+      {!!turn.sources.length && <div className="message-sources" aria-label="Источники">
+        <div className="sources-label">Источники <span>{turn.sources.length}</span></div>
+        {turn.sources.map((source) => <SourceCard key={source.source_id} source={source} />)}
+      </div>}
       {eligible && (appeal ? <div className="appeal-receipt">
         <strong>Обращение {appeal.id}</strong><span>{statusText(statuses, appeal.status)} · {statusText(delivery, appeal.notification.status)}</span>
       </div> : <button className="button appeal-button" disabled={action} onClick={() => void createAppeal()}>
         {action ? <LoaderCircle className="spin" size={16} /> : <Send size={16} />} Создать обращение
       </button>)}
+      {text && <button className="icon-button copy-button" onClick={() => void copy()} title={copied ? 'Скопировано' : 'Копировать ответ'}
+        aria-label={copied ? 'Скопировано' : 'Копировать ответ'}>{copied ? <Check size={15} /> : <ClipboardCopy size={15} />}</button>}
       {error && <Notice tone="error">{error}</Notice>}
+      </div>
     </article>}
   </div>
 }
