@@ -62,6 +62,26 @@ class AgentRetrievalTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["result"]["source_ids"], [hit.source_id])
 
+    def test_ambiguous_http_applies_followup_filter(self):
+        from test_agent_api import FakeModel, draft
+        from test_quality_api import QualityTests
+
+        question = "Кто согласует доступ к стенду?"
+        hits, details = self.adapter.search_with_context(question, top_k=1, stage="implementation")
+        self.assertEqual(len(hits), 1)
+        self.assertTrue(details["relationships"])
+        ib = self.adapter.search_documents(question, 1, "ib", "implementation")[0]
+        tech = self.adapter.search_documents(question, 1, "tech", "implementation")[0]
+        model = FakeModel(draft("CLARIFY", ib, tech, field="department", question="Какое подразделение?"),
+                          draft("ANSWER", tech))
+        self.client.app.state.agent.model = model
+        api = QualityTests()
+        dialogue = api.dialogue(self.client)
+        self.assertEqual(api.send(self.client, dialogue, question)["result"]["result_type"], "CLARIFY")
+        result = api.send(self.client, dialogue, "Техническая дирекция")
+        self.assertEqual(result["result"]["source_ids"], [tech.source_id])
+        self.assertNotIn(ib.source_id, [source["source_id"] for source in model.calls[-1][1]["sources"]])
+
     def test_numbered_section_with_multiple_chunks_and_unverified_preface(self):
         from docx import Document
         document = Document()

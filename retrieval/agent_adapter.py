@@ -34,7 +34,7 @@ class AgentRetrieval(RegulationSearch):
         except LongQuery as exc:
             raise RetrievalError("Refined question exceeds the local encoder limit") from exc
 
-    def _rank_candidates(self, question, allowed, top_k, metrics, departments, stages, refs):
+    def _rank_candidates(self, question, allowed, top_k, metrics, departments, stages, refs, inactive):
         previous = self.expert_generation if self.pool_marker == self.marker else None
         snapshot = self.experts.snapshot(previous, self.encoder)
         if snapshot is not None:
@@ -49,7 +49,7 @@ class AgentRetrieval(RegulationSearch):
             self.pool_marker, self.expert_generation = self.marker, generation
         self.expert_hits = []
         if not self.extra_results:
-            return super()._rank_candidates(question, allowed, top_k, metrics, departments, stages, refs)
+            return super()._rank_candidates(question, allowed, top_k, metrics, departments, stages, refs, inactive)
         start = len(self.saved.chunks)
         candidates = {start + i: hit for i, hit in enumerate(self.extra_results)
                       if (not departments or not hit.department or hit.department in departments)
@@ -62,7 +62,7 @@ class AgentRetrieval(RegulationSearch):
         allowed.update(i for i, hit in candidates.items()
                        if published.get(hit.source_id) == hit.expert_metadata.revision)
         order, scores = self._rank(question, allowed, top_k, metrics, self.pool_ids, self.pool_chunks,
-                                   self.pool_vectors, self.pool_lexical, split_at=start)
+                                   self.pool_vectors, self.pool_lexical, split_at=start, inactive=inactive)
         self.expert_hits = [replace(candidates[i], score=scores[i]) for i in order if i >= start]
         return [i for i in order if i < start], scores
 

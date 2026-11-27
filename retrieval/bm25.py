@@ -9,6 +9,10 @@ import snowballstemmer
 
 WORDS = re.compile(r"\d+(?:\.\d+)+|[^\W_]+", re.UNICODE)
 STOP = frozenset("а в во на к у по и с со из для о об от это как кто что где когда какой какая какие ли чем сколько можно нужно пункт пункте п".split())
+POLITE_INTRO = re.compile(r"\b(?:пожалуйста|подскажите|каким образом)\b")
+SEPARATED_ABBREVIATION = re.compile(r"(?<!\w)[a-zа-я](?:[.\-‑–][a-zа-я]){1,5}(?!\w)")
+RUSSIAN = "абвгдежзийклмнопрстуфхцчшщъыьэюя"
+LATIN_LOOKALIKES = str.maketrans("abcehkmoptxy", "авсенкмортху")
 QUALIFIERS = frozenset("не ни без если кроме только при нельзя исключение".split())
 
 
@@ -46,14 +50,73 @@ class BM25:
 
     def terms(self, text):
         text = normalize(text)
+
+        def join_abbreviation(match):
+            joined = re.sub(r"[^a-zа-я]", "", match[0])
+            return joined if joined in self.abbreviations else match[0]
+
+        text = SEPARATED_ABBREVIATION.sub(join_abbreviation, text)
         if self.pattern:
             text = self.pattern.sub(lambda m: self.aliases[m[0]], text)
         return [self.stemmer.stemWord(w) if len(w) >= 4 and w.isalpha() and w not in
                 self.abbreviations and w not in QUALIFIERS else w
                 for w in WORDS.findall(text) if w not in STOP]
 
-    def scores(self, question, allowed, coverage):
+    def scores(self, question, allowed, coverage, *, repair=True):
         terms = set(self.terms(question))
+        scores = self._scores(terms, allowed, coverage)
+        if scores or not repair:
+            return scores
+        simplified = set(self.terms(POLITE_INTRO.sub(" ", normalize(question))))
+        if simplified != terms:
+            scores = self._scores(simplified, allowed, coverage)
+        if scores:
+            return scores
+        corrected = self._repair(question, simplified, allowed)
+        return self._scores(corrected, allowed, coverage) if corrected else {}
+
+    def _repair(self, question, terms, allowed):
+        def eligible(term):
+            return (term not in self.abbreviations and term not in QUALIFIERS
+                    and any(i in allowed for i, _ in self.postings.get(term, ())))
+
+        unknown = {}
+        for raw in WORDS.findall(question):
+            word = normalize(raw)
+            if not 5 <= len(word) <= 18 or not word.isalpha() or raw.isupper():
+                continue
+            stem = self.stemmer.stemWord(word)
+            if stem in terms and stem not in self.postings and word not in self.abbreviations:
+                unknown[stem] = word
+        if len(unknown) > 4:
+            return None
+        for stem, word in unknown.items():
+            if re.search(r"[а-я]", word) and re.search(r"[a-z]", word):
+                canonical = word.translate(LATIN_LOOKALIKES)
+                match = self.stemmer.stemWord(canonical)
+                matches = {match} if eligible(match) else set()
+            elif all(letter in RUSSIAN for letter in stem):
+                matches = {candidate for candidate in self._one_edits(stem) if eligible(candidate)}
+            else:
+                continue
+            if len(matches) == 1:
+                return (terms - {stem}) | matches
+        return None
+
+    @staticmethod
+    def _one_edits(term):
+        for i in range(len(term) + 1):
+            left, right = term[:i], term[i:]
+            for letter in RUSSIAN:
+                yield left + letter + right
+                if right and letter != right[0]:
+                    yield left + letter + right[1:]
+            if right:
+                yield left + right[1:]
+            if len(right) > 1 and right[0] != right[1]:
+                yield left + right[1] + right[0] + right[2:]
+
+    def _scores(self, terms, allowed, coverage):
         anchors = terms - QUALIFIERS
         if not anchors:
             return {}

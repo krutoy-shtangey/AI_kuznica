@@ -192,11 +192,11 @@ class RegulationSearch:
             return results, dict(generation=self.saved.manifest["generation"], candidates=self.candidate_details,
                                  relationships=relationships(self.candidate_details))
 
-    def _rank_candidates(self, question, allowed, top_k, metrics, departments, stages, refs):
+    def _rank_candidates(self, question, allowed, top_k, metrics, departments, stages, refs, inactive):
         return self._rank(question, allowed, top_k, metrics, self.source_ids, self.saved.chunks,
-                          self.saved.vectors, self.lexical)
+                          self.saved.vectors, self.lexical, inactive=inactive)
 
-    def _rank(self, question, allowed, top_k, metrics, source_ids, chunks, vectors, lexical, *, split_at=None):
+    def _rank(self, question, allowed, top_k, metrics, source_ids, chunks, vectors, lexical, *, split_at=None, inactive=()):
         if not allowed:
             return [], {}
         cfg = self.settings
@@ -217,9 +217,11 @@ class RegulationSearch:
             return kept
 
         rankings = []
+        lexical_scores = {}
         if lexical is not None:
             t = perf_counter()
-            scores = lexical.scores(question, allowed, cfg.lexical_coverage)
+            lexical_scores = lexical.scores(question, allowed, cfg.lexical_coverage)
+            scores = lexical_scores
             rankings.append((cfg.lexical_weight, shortlist(scores)))
             metrics.bm25_ms = ms(t)
         if cfg.mode != "bm25":
@@ -232,6 +234,13 @@ class RegulationSearch:
             t = perf_counter()
             values = vectors @ query
             scores = {i: float(values[i]) for i in allowed if values[i] >= cfg.cosine_floor}
+            if cfg.mode == "hybrid" and scores and inactive:
+                stale_matches = lexical.scores(question, inactive, .8, repair=False)
+                if stale_matches:
+                    # A near-threshold semantic match cannot replace a strongly matched stale rule by itself.
+                    threshold = min(cfg.cosine_floor + .02, max(values[i] for i in stale_matches))
+                    scores = {i: score for i, score in scores.items()
+                              if i in lexical_scores or score >= threshold or chunks[i].get("regulation") is None}
             rankings.append((cfg.semantic_weight, shortlist(scores)))
             metrics.semantic_ms = ms(t)
         t = perf_counter()
@@ -255,13 +264,14 @@ class RegulationSearch:
         refs = set(REFERENCE.findall(question))
         today = date.today()
         states = [lifecycle(c["regulation"], today) for c in chunks]
-        allowed = {i for i, c in enumerate(chunks)
-                   if (not self.require_citation or self.citations[i])
-                   and (cfg.include_history or states[i] in ("unknown", "approved"))
-                   and (not departments or c["department"] is None or c["department"] in departments)
-                   and (not stages or c["stage"] is None or c["stage"] in stages)
-                   and (not refs or refs.intersection({c["section"], *(s["section"] for s in c["spans"])}))}
-        order, scores = self._rank_candidates(question, allowed, top_k, metrics, departments, stages, refs)
+        scoped = {i for i, c in enumerate(chunks)
+                  if (not self.require_citation or self.citations[i])
+                  and (not departments or c["department"] is None or c["department"] in departments)
+                  and (not stages or c["stage"] is None or c["stage"] in stages)
+                  and (not refs or refs.intersection({c["section"], *(s["section"] for s in c["spans"])}))}
+        allowed = {i for i in scoped if cfg.include_history or states[i] in ("unknown", "approved")}
+        inactive = {i for i in scoped - allowed if states[i] in ("expired", "revoked", "replaced")}
+        order, scores = self._rank_candidates(question, allowed, top_k, metrics, departments, stages, refs, inactive)
         def ranked(scores):
             return sorted(scores, key=lambda i: (-scores[i], self.source_ids[i]))
 
