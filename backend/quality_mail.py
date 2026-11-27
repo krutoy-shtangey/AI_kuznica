@@ -9,6 +9,8 @@ from time import time
 from urllib.parse import urlencode, urlsplit
 from uuid import uuid4
 
+import certifi
+
 
 class MailUncertain(Exception):
     """The relay may have accepted the message. Do not send it again."""
@@ -98,12 +100,17 @@ class SMTPMailer:
         connection = None
         sending = False
         try:
+            context = None
+            if config.ssl or config.tls:
+                context = ssl.create_default_context()
+                # Keep system and custom roots and add the public CA bundle.
+                context.load_verify_locations(cafile=certifi.where())
             if config.ssl:
-                connection = smtplib.SMTP_SSL(config.host, config.port, timeout=10, context=ssl.create_default_context())
+                connection = smtplib.SMTP_SSL(config.host, config.port, timeout=10, context=context)
             else:
                 connection = smtplib.SMTP(config.host, config.port, timeout=10)
                 if config.tls:
-                    connection.starttls(context=ssl.create_default_context())
+                    connection.starttls(context=context)
             if config.username:
                 connection.login(config.username, config.password)
             sending = True
