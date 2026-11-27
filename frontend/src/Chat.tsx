@@ -1,8 +1,8 @@
-import { ArrowRight, ArrowUp, Check, ChevronDown, ClipboardCopy, FileSearch, GitBranch, Inbox, LifeBuoy, LoaderCircle, Send, TriangleAlert } from 'lucide-react'
+import { ArrowRight, ArrowUp, Check, ClipboardCopy, FileSearch, GitBranch, Inbox, LifeBuoy, LoaderCircle, Send, TriangleAlert } from 'lucide-react'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import { api } from './api'
-import type { ContextMode, Dialogue, History, Mode, PublicAppeal, Turn, Usage } from './api'
+import type { Dialogue, History, Mode, PublicAppeal, Turn, Usage } from './api'
 import { BrandMark, delivery, errorLabels, errorText, Notice, SourceCard, statuses, statusText } from './ui'
 
 const examples = [
@@ -25,7 +25,6 @@ type ChatProps = {
 export default function Chat({ current, mode, onCreate, onTitle, onUsage, appeals, onAppeal, visible }: ChatProps) {
   const [histories, setHistories] = useState<Record<string, History>>({})
   const [drafts, setDrafts] = useState<Record<string, string>>({})
-  const [contexts, setContexts] = useState<Record<string, ContextMode>>({})
   const [readError, setReadError] = useState('')
   const [sendError, setSendError] = useState<{ id: string; message: string; submitted: string } | null>(null)
   const [loadingMore, setLoadingMore] = useState(false)
@@ -41,7 +40,6 @@ export default function Chat({ current, mode, onCreate, onTitle, onUsage, appeal
   const turns = history?.messages ?? []
   const pending = sending?.id === id ? sending : null
   const draft = drafts[id] ?? ''
-  const context = contexts[id] ?? 'auto'
   const last = turns.at(-1)
   const canSend = !!draft.trim() && !sending && (!id || !!history) && mode !== 'disabled'
 
@@ -103,7 +101,7 @@ export default function Chat({ current, mode, onCreate, onTitle, onUsage, appeal
       setSending({ id: targetId, text: message })
       setDrafts((old) => ({ ...old, [id]: '', [targetId]: '' }))
       if (!turns.length) onTitle(targetId, message)
-      const answer = await api.message(target, message, context)
+      const answer = await api.message(target, message, 'auto')
       setHistories((old) => {
         const previous = old[targetId]
         return { ...old, [targetId]: {
@@ -113,7 +111,6 @@ export default function Chat({ current, mode, onCreate, onTitle, onUsage, appeal
         } }
       })
       onUsage(targetId, answer.dialogue_usage)
-      setContexts((old) => ({ ...old, [targetId]: 'auto' }))
     } catch (error) {
       const targetId = target?.dialogue_id ?? id
       setSendError({ id: targetId, message: errorText(error), submitted: message })
@@ -189,15 +186,10 @@ export default function Chat({ current, mode, onCreate, onTitle, onUsage, appeal
             placeholder={last?.result?.result_type === 'CLARIFY' ? 'Напишите уточнение…' : 'Задайте вопрос по регламентам…'}
             onChange={(event) => changeDraft(event.target.value)} onKeyDown={keyboard} />
           <div className="composer-actions">
-            <label className="context-select"><span className="sr-only">Контекст сообщения</span>
-              <select value={context} onChange={(event) => setContexts((old) => ({ ...old, [id]: event.target.value as ContextMode }))}>
-                <option value="auto">Автоконтекст</option><option value="new">Новая тема</option><option value="follow_up">Продолжить тему</option>
-              </select><ChevronDown size={13} aria-hidden="true" />
-            </label>
-            <div className="send-controls">{draft.length >= 1750 && <span className="counter">{draft.length} / 2000</span>}
-              <button className="send-button" type="submit" disabled={!canSend} aria-label="Отправить сообщение">
-                {pending ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={20} />}
-              </button></div>
+            {draft.length >= 1750 && <span className="counter">{draft.length} / 2000</span>}
+            <button className="send-button" type="submit" disabled={!canSend} aria-label="Отправить сообщение">
+              {pending ? <LoaderCircle className="spin" size={17} /> : <ArrowUp size={20} />}
+            </button>
           </div>
         </form>
       </div>

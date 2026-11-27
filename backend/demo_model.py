@@ -33,7 +33,11 @@ class FixtureModel:
             selected = [item for item in sources if item["source_type"] == "expert_answer"][:1]
             if not selected:
                 kind = "NO_ANSWER"
-        evidence = [{"source_id": item["source_id"], "quote": item["excerpt"]} for item in selected]
+        evidence = [
+            {"source_id": item["source_id"], "quote": item["excerpt"],
+             **({"answer_branch": item["excerpt"]} if kind == "CLARIFY" else {})}
+            for item in selected
+        ]
         value = schema.model_validate_json(json.dumps({
             "result_type": kind, "field": field, "question": question, "evidence": evidence,
         }))

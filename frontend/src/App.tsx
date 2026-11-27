@@ -37,6 +37,8 @@ export default function App() {
   const [data, setData] = useState(saved)
   const [page, setPage] = useState<Page>(currentPage)
   const [mode, setMode] = useState<Mode | null>(null)
+  const [serverModel, setServerModel] = useState<'offline-fixture' | 'proxyapi-qwen'>()
+  const offlineFixture = serverModel === 'offline-fixture'
   const [healthError, setHealthError] = useState(false)
   const [drawer, setDrawer] = useState(false)
   const [collapsed, setCollapsed] = useState(false)
@@ -60,7 +62,11 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    api.health().then((result) => { setMode(result.retrieval); setHealthError(false) })
+    api.health().then((result) => {
+      setMode(result.retrieval)
+      setServerModel(result.model)
+      setHealthError(false)
+    })
       .catch(() => setHealthError(true))
   }, [])
 
@@ -154,7 +160,7 @@ export default function App() {
         </div>
       </div>
       <div className={'sidebar-status' + (mode === 'demo' ? ' demo-status' : '')}><span className={'status-dot ' + (healthError || mode === 'disabled' ? 'inactive' : '')} />
-        {healthError ? 'Нет связи с сервером' : mode === 'demo' ? 'Демонстрационный режим' : mode === 'configured' ? 'Поиск подключён' : mode === 'disabled' ? 'Поиск не подключён' : 'Проверяем подключение…'}
+        {healthError ? 'Нет связи с сервером' : offlineFixture ? 'Локальный поиск · тестовая модель' : serverModel === 'proxyapi-qwen' ? 'Рабочий режим · Qwen через ProxyAPI' : mode === 'demo' ? 'Демонстрационный режим' : mode === 'configured' ? 'Поиск подключён' : mode === 'disabled' ? 'Поиск не подключён' : 'Проверяем подключение…'}
       </div>
     </aside>
     <main id="content" tabIndex={-1} className="workspace">
@@ -168,7 +174,7 @@ export default function App() {
           }}><PanelLeftOpen size={20} /></button>}
         <div className="breadcrumb"><strong>{activeSection.title}</strong></div>
         {mode === 'demo' && <span className="top-demo" aria-label="Демонстрационный режим">Демо</span>}
-        {page === 'chat' && <button className="button header-metrics" aria-label="Метрики диалога" onClick={() => navigate('analytics')}><BarChart3 size={16} /> <span>Метрики диалога</span></button>}
+        {offlineFixture && <span className="top-demo">Тестовая модель</span>}
       </header>
       {(createError || storageError) && <div className="global-notice"><Notice tone="error">
         {createError || 'Не удалось сохранить список диалогов в браузере.'}
@@ -176,13 +182,13 @@ export default function App() {
       <Chat current={current} mode={mode} visible={page === 'chat'} onCreate={create} onTitle={title}
         onUsage={updateUsage} appeals={data.appeals} onAppeal={addAppeal} />
       {page === 'quality' && <Quality token={secret} onToken={setSecret} />}
-      {page === 'knowledge' && <Knowledge dialogues={data.dialogues} />}
+      {page === 'knowledge' && <Knowledge dialogues={data.dialogues} indexedCatalogue={!!serverModel} />}
       {page === 'analytics' && <Analytics dialogue={current} usage={current ? usage[current.dialogue_id] : undefined} onUsage={updateUsage} />}
     </main>
   </div>
 }
 
-function Knowledge({ dialogues }: { dialogues: Dialogue[] }) {
+function Knowledge({ dialogues, indexedCatalogue }: { dialogues: Dialogue[]; indexedCatalogue: boolean }) {
   const [sources, setSources] = useState<Source[]>([])
   const [busy, setBusy] = useState(true)
   const [incomplete, setIncomplete] = useState(false)
@@ -193,13 +199,27 @@ function Knowledge({ dialogues }: { dialogues: Dialogue[] }) {
     async function catalogue() {
       const collected = new Map<string, Source>()
       let failed = false
+      setIncomplete(false)
       setBusy(true)
+      if (indexedCatalogue) {
+        try {
+          const { documents } = await api.knowledge(controller.signal)
+          for (const document of documents) collected.set(document.source_id, document)
+        } catch {
+          if (controller.signal.aborted) return
+          setSources([])
+          setIncomplete(true)
+          setBusy(false)
+          return
+        }
+      }
       for (const dialogue of dialogues) {
         try {
           let cursor: number | null = null
           do {
             const history = await api.history(dialogue, cursor ?? undefined, controller.signal)
             for (const turn of [...history.messages].reverse()) for (const source of turn.sources) {
+              if (indexedCatalogue && source.source_type === 'regulation') continue
               if (!collected.has(source.source_id) || (collected.get(source.source_id)?.revision ?? 0) < (source.revision ?? 0)) {
                 collected.set(source.source_id, source)
               }
@@ -215,20 +235,22 @@ function Knowledge({ dialogues }: { dialogues: Dialogue[] }) {
     }
     void catalogue()
     return () => controller.abort()
-  }, [dialogues])
+  }, [dialogues, indexedCatalogue])
   const found = sources.filter((source) => (!kind || kind === source.source_type) && (
     [source.document, source.section, source.excerpt].some((value) => value?.toLowerCase().includes(term.trim().toLowerCase()))
   ))
   return <div className="page">
-    <div className="page-heading"><div><h1>База знаний</h1><p>Источники, которые использовались в ваших сохранённых диалогах.</p></div></div>
+    <div className="page-heading"><div><h1>База знаний</h1><p>{indexedCatalogue
+      ? 'Регламенты из локального индекса и разъяснения из сохранённых диалогов.'
+      : 'Источники, которые использовались в ваших сохранённых диалогах.'}</p></div></div>
     <div className="catalog-controls"><label className="search-input"><Search size={17} /><span className="sr-only">Поиск по источникам</span>
       <input placeholder="Название документа или текст цитаты" value={term} onChange={(event) => setTerm(event.target.value)} /></label>
       <label><span className="sr-only">Тип источника</span><select value={kind} onChange={(event) => setKind(event.target.value as typeof kind)}>
         <option value="">Все источники</option><option value="regulation">Регламенты</option><option value="expert_answer">Экспертные разъяснения</option>
       </select></label>
     </div>
-    <div className="catalog-note"><Notice>Полный каталог регламентов появится после подключения соответствующего API.</Notice></div>
-    {incomplete && <Notice tone="error">Часть сохранённых диалогов недоступна.</Notice>}
+    {!indexedCatalogue && <div className="catalog-note"><Notice>Полный каталог регламентов появится после подключения соответствующего API.</Notice></div>}
+    {incomplete && <Notice tone="error">{indexedCatalogue ? 'Часть источников недоступна.' : 'Часть сохранённых диалогов недоступна.'}</Notice>}
     {busy ? <p role="status" className="muted">Загрузка источников…</p> : found.length ?
       <div className="catalog-grid">{found.map((source) => <SourceCard key={source.source_id} source={source} />)}</div> :
       <div className="panel empty-page"><Database size={28} /><h2>{sources.length ? 'Ничего не найдено' : 'Источников пока нет'}</h2>

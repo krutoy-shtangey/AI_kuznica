@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
-from backend.agent import SYSTEM_PROMPT, EvidenceDraft
+from backend.agent import SYSTEM_PROMPT, Agent, DialogueState, EvidenceDraft, _focus_in_excerpt
 from backend.llm import AttemptMetrics, CallMetrics, ErrorCode, JsonMode, LLMError, LLMResult
 from backend.main import create_app
 from shared.contracts import (
@@ -44,7 +44,9 @@ USAGE = CallMetrics((AttemptMetrics("stub", 0.125, JsonMode.OBJECT, 10, 3, 13,
 def draft(kind, *evidence, field=None, question=None):
     return EvidenceDraft.model_validate_json(json.dumps({
         "result_type": kind, "field": field, "question": question,
-        "evidence": [{"source_id": item.source_id, "quote": item.text} if isinstance(item, SearchResult) else item
+        "evidence": [{"source_id": item.source_id, "quote": item.text,
+                      **({"answer_branch": item.text} if kind == "CLARIFY" else {})}
+                     if isinstance(item, SearchResult) else item
                      for item in evidence],
     }))
 
@@ -123,16 +125,105 @@ class APIAgentTests(unittest.TestCase):
         self.assertEqual(len(model.calls[0][1]["sources"]), 1)
         self.assertEqual(outcome["dialogue_usage"]["total_tokens"], 13)
 
-    def test_ambiguous_department_even_if_model_hastily_answers(self):
+    def test_uncited_other_department_does_not_turn_answer_into_clarification(self):
         client, _, _ = self.launch([IB, TECH_PRE], draft("ANSWER", IB))
+        outcome = self.send(client, self.dialogue(client), "Кто регистрирует пульт?")
+        self.assertEqual(outcome["result"]["result_type"], "ANSWER")
+        self.assertEqual(outcome["result"]["source_ids"], [IB.source_id])
+
+    def test_two_different_verified_answers_can_require_scope(self):
+        client, _, _ = self.launch([IB, TECH_PRE], draft(
+            "ANSWER", {"source_id": IB.source_id, "quote": IB.text, "answer_branch": "дежурный"},
+            {"source_id": TECH_PRE.source_id, "quote": TECH_PRE.text, "answer_branch": "диспетчер"},
+        ))
         outcome = self.send(client, self.dialogue(client), "Кто регистрирует пульт?")
         self.assertEqual(outcome["result"]["result_type"], "CLARIFY")
         self.assertIn("подразделение", outcome["result"]["clarification_question"])
 
+    def test_indirect_hits_do_not_justify_clarification_and_can_be_referred(self):
+        ib = source("1", "Команда согласует доступ к архиву.", "ib")
+        tech = source("2", "Дежурный проверяет шкаф с носителями.", "tech")
+        client, _, model = self.launch([ib, tech], draft(
+            "CLARIFY", {"source_id": ib.source_id, "quote": ib.text},
+            {"source_id": tech.source_id, "quote": tech.text},
+            field="department", question="Какое подразделение?",
+        ))
+        path, headers = self.dialogue(client)
+        response = self.send(client, (path, headers), "Сколько дней хранятся резервные копии?")
+        self.assertEqual(response["result"]["result_type"], "NO_ANSWER")
+        self.assertEqual(len(model.calls), 1)
+        self.assertEqual(len(model.calls[0][1]["sources"]), 2)
+        appeal = client.post(path.removesuffix("/messages") + "/appeals", headers=headers,
+                             json={"turn_id": response["turn_id"]})
+        self.assertEqual(appeal.status_code, 201)
+
+    def test_model_cannot_treat_a_general_rule_as_covering_a_specific_subject(self):
+        general = source("1", "Утилизация проводится после регистрации имущества.")
+        specific = source("2", "Просроченные аккумуляторы передаются подрядчику.")
+        question = "Как проводится утилизация просроченных аккумуляторов?"
+        replies = [draft("ANSWER", *hits).model_copy(update={"question_focus": "просроченных аккумуляторов"})
+                   for hits in ((general,), (general, specific))]
+        model = FakeModel(*replies)
+        agent = Agent(Search([general, specific]), model, require_focus=True)
+        for expected in ("NO_ANSWER", "ANSWER"):
+            outcome = agent.reply("test", DialogueState(), question, "auto")
+            self.assertEqual(outcome.result.result_type, expected)
+            if expected == "ANSWER":
+                self.assertEqual(outcome.result.source_ids, (specific.source_id,))
+        self.assertEqual(len(model.calls), 2)
+
+    def test_focus_allows_rephrased_action_but_requires_the_qualifier(self):
+        excerpt = "Работы до утверждения плана начинаются после проверки."
+        self.assertTrue(_focus_in_excerpt("запуск работ до утверждения плана", excerpt))
+        self.assertFalse(_focus_in_excerpt("запуск работ до утверждения отдельного бюджета", excerpt))
+
+    def test_answer_keeps_verified_complementary_clause_with_distinct_question_anchor(self):
+        main = source("1", "Для допуска экспедиционной группы требуется подтверждение координатора.", "tech")
+        extra = source("2", "При плохой видимости дополнительно требуется сигнальный маячок.", "tech")
+        unrelated = source("3", "Сигнальный маячок хранится на складе.", "tech")
+        question = "Каковы условия допуска экспедиционной группы при плохой видимости?"
+        option = lambda hit, anchor: {"source_id": hit.source_id, "quote": hit.text, "question_anchor": anchor}
+        reply = draft("ANSWER", main, option(extra, "плохой видимости"),
+                      option(unrelated, "плохой видимости")).model_copy(update={"question_focus": "экспедиционной группы"})
+        model = FakeModel(reply)
+        answer = Agent(Search([extra, unrelated, main]), model, require_focus=True).reply(
+            "test", DialogueState(), question, "auto")
+        self.assertEqual(answer.result.source_ids, (main.source_id, extra.source_id))
+        self.assertIn("сигнальный маячок", answer.result.text)
+        self.assertEqual(len(model.calls), 1)
+
+    def test_long_anchor_keeps_condition_with_different_wording_but_full_qualifier(self):
+        limit = source("20", "Перевозка партии образцов допускается после получения визы начальника.", "tech")
+        condition = source("21", "Для перемещения проб после получения визы начальника требуется термоконтейнер.", "tech")
+        wrong = source("22", "Для перемещения проб после получения визы инженера ведётся журнал.", "tech")
+        different_scope = source("23", "Для перемещения проб после получения визы начальника требуется опись.", "ib")
+        anchor = "При каких условиях возможна перевозка партии образцов после получения визы начальника"
+        evidence = [
+            {"source_id": item.source_id, "quote": item.text, "question_anchor": anchor, "role": role}
+            for item, role in ((condition, "condition"), (wrong, "condition"), (different_scope, "condition"), (limit, "rule"))
+        ]
+        model = FakeModel(draft("ANSWER", *evidence).model_copy(update={"question_focus": "перевозка партии образцов"}))
+        outcome = Agent(Search([limit, condition, wrong, different_scope]), model, require_focus=True).reply(
+            "test", DialogueState(), anchor + "?", "auto")
+        self.assertEqual(outcome.result.source_ids, (limit.source_id, condition.source_id))
+        self.assertTrue(outcome.result.text.startswith("Основное правило"))
+        self.assertIn("Обязательные условия", outcome.result.text)
+
+    def test_same_answer_in_two_departments_does_not_justify_clarification(self):
+        common = "дежурный"
+        tech = source("2", "При обычном режиме пульт регистрирует дежурный.", "tech", "presale")
+        client, _, _ = self.launch([IB, tech], draft(
+            "CLARIFY", {"source_id": IB.source_id, "quote": IB.text, "answer_branch": common},
+            {"source_id": tech.source_id, "quote": tech.text, "answer_branch": common},
+            field="department", question="Какое подразделение?",
+        ))
+        outcome = self.send(client, self.dialogue(client), "Кто регистрирует пульт?")
+        self.assertEqual(outcome["result"]["result_type"], "ANSWER")
+
     def test_two_consecutive_scope_clarifications(self):
         client, search, model = self.launch(
             [IB, TECH_PRE, TECH_IMPL],
-            draft("CLARIFY", IB, TECH_PRE, field="department", question="Какое подразделение?"),
+            draft("CLARIFY", IB, TECH_PRE, field="department"),
             draft("CLARIFY", TECH_PRE, TECH_IMPL, field="stage", question="Какой этап?"),
             draft("ANSWER", TECH_IMPL),
         )
@@ -148,17 +239,54 @@ class APIAgentTests(unittest.TestCase):
         self.assertEqual(search.calls[-1][1:], ("tech", "implementation"))
         self.assertEqual(model.calls[-1][1]["clarifications"], ["Техническая дирекция", "На реализации"])
 
+    def test_same_actor_in_both_stages_is_answered_without_clarification(self):
+        pre = source("20", "Смотритель выдаёт талон на пресейле.", "tech", "presale")
+        work = source("21", "Талон выдаёт смотритель при реализации.", "tech", "implementation")
+        client, _, _ = self.launch([pre, work], draft(
+            "CLARIFY", {"source_id": pre.source_id, "quote": pre.text, "answer_branch": "Смотритель выдаёт талон"},
+            {"source_id": work.source_id, "quote": work.text, "answer_branch": "Талон выдаёт смотритель"},
+            field="stage", question="Какой этап?",
+        ))
+        output = self.send(client, self.dialogue(client), "Кто выдаёт талон в Технической дирекции?")
+        self.assertEqual(output["result"]["result_type"], "ANSWER")
+        self.assertEqual(len(output["sources"]), 2)
+
+    def test_confirmed_department_persists_but_new_question_drops_old_stage(self):
+        client, search, model = self.launch(
+            [IB, TECH_PRE, TECH_IMPL, OTHER],
+            draft("CLARIFY", IB, TECH_PRE, field="department", question="Какое подразделение?"),
+            draft("ANSWER", TECH_PRE),
+            draft("ANSWER", OTHER),
+        )
+        dialogue = self.dialogue(client)
+        self.send(client, dialogue, "Кто регистрирует пульт на пресейле?")
+        self.send(client, dialogue, "Техническая дирекция")
+        self.send(client, dialogue, "Когда выключают лампы?")
+        self.assertEqual(search.calls[-1][1:], ("tech", None))
+        self.assertIsNone(model.calls[-1][1]["previous_subject"])
+
     def test_both_scope_fields_given(self):
         client, search, _ = self.launch([IB, TECH_PRE, TECH_IMPL], draft("ANSWER", TECH_IMPL))
         output = self.send(client, self.dialogue(client), "Кто регистрирует пульт при реализации в Технической дирекции?")
         self.assertEqual(output["result"]["result_type"], "ANSWER")
         self.assertEqual(search.calls[-1][1:], ("tech", "implementation"))
 
+    def test_model_cannot_repeat_an_already_confirmed_clarification(self):
+        client, _, _ = self.launch(
+            [TECH_PRE, TECH_IMPL],
+            draft("CLARIFY", TECH_PRE, TECH_IMPL, field="stage", question="Какой этап?"),
+            draft("CLARIFY", TECH_IMPL, field="stage", question="Укажите стадию?"),
+        )
+        dialogue = self.dialogue(client)
+        self.assertEqual(self.send(client, dialogue, "Кто регистрирует пульт в Технической дирекции?")
+                         ["result"]["result_type"], "CLARIFY")
+        self.assertEqual(self.send(client, dialogue, "Реализация")["result"]["result_type"], "NO_ANSWER")
+
     def test_followup_preserves_subject_and_scope(self):
         client, search, model = self.launch([TECH_IMPL, RECEIPT], draft("ANSWER", TECH_IMPL), draft("ANSWER", RECEIPT))
         dialog = self.dialogue(client)
         self.send(client, dialog, "Кто регистрирует пульт на реализации в Технической дирекции?")
-        output = self.send(client, dialog, "А где хранится квитанция?")
+        output = self.send(client, dialog, "Где хранится квитанция по пульту?")
         self.assertEqual(output["result"]["source_ids"], [RECEIPT.source_id])
         self.assertIn("регистрирует пульт", model.calls[-1][1]["previous_subject"])
         self.assertEqual(search.calls[-1][1:], ("tech", "implementation"))
@@ -170,9 +298,17 @@ class APIAgentTests(unittest.TestCase):
         )
         dialog = self.dialogue(client)
         self.send(client, dialog, "Кто регистрирует пульт в Технической дирекции?")
-        self.send(client, dialog, "Новая тема: когда выключать лампы?")
+        self.send(client, dialog, "А когда выключать лампы")
         self.assertIsNone(model.calls[-1][1]["previous_subject"])
         self.assertEqual(search.calls[-1][1:], (None, None))
+
+    def test_new_subject_in_same_department_does_not_inherit_stage(self):
+        client, search, model = self.launch([TECH_IMPL, OTHER], draft("ANSWER", TECH_IMPL), draft("ANSWER", OTHER))
+        dialogue = self.dialogue(client)
+        self.send(client, dialogue, "Кто регистрирует пульт на реализации в Технической дирекции?")
+        self.send(client, dialogue, "А когда выключают лампы в Технической дирекции?")
+        self.assertEqual(search.calls[-1][1:], ("tech", None))
+        self.assertIsNone(model.calls[-1][1]["previous_subject"])
 
     def test_no_information_avoids_model_on_empty_retrieval(self):
         client, _, model = self.launch([])
@@ -188,10 +324,10 @@ class APIAgentTests(unittest.TestCase):
         self.assertEqual(len(output["sources"]), 2)
         self.assertIn("Обратитесь в службу качества", output["result"]["text"])
 
-    def test_conflict_between_departments_is_resolved_by_clarification(self):
+    def test_rules_of_different_departments_are_not_a_conflict(self):
         client, _, _ = self.launch([IB, TECH_PRE], draft("CONFLICT", IB, TECH_PRE))
         output = self.send(client, self.dialogue(client), "Кто регистрирует пульт на пресейле?")
-        self.assertEqual(output["result"]["result_type"], "CLARIFY")
+        self.assertEqual(output["result"]["result_type"], "NO_ANSWER")
 
     def assert_bad_evidence(self, bad):
         client, _, _ = self.launch([TECH_IMPL], draft("ANSWER", bad))
@@ -265,8 +401,10 @@ class APIAgentTests(unittest.TestCase):
 
     def test_other_clarification_and_loop_limit(self):
         question = draft(
-            "CLARIFY", {"source_id": CONDITIONS.source_id, "quote": "Для круглого пульта нужен код К."},
-            {"source_id": CONDITIONS.source_id, "quote": "Для квадратного нужен код В."},
+            "CLARIFY", {"source_id": CONDITIONS.source_id, "quote": "Для круглого пульта нужен код К.",
+                        "answer_branch": "код К"},
+            {"source_id": CONDITIONS.source_id, "quote": "Для квадратного нужен код В.",
+             "answer_branch": "код В"},
             field="other", question="Пульт круглый или квадратный?",
         )
         client, search, model = self.launch([CONDITIONS], question, question)

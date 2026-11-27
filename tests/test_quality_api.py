@@ -168,6 +168,10 @@ class QualityTests(unittest.TestCase):
         self.put_expert_into_model(model, card)
         reply = self.send(client, self.dialogue(client))
         self.assertEqual(reply["result"]["result_type"], "ANSWER")
+        sent = model.calls[-1][1]["sources"][0]
+        self.assertEqual(sent["excerpt"], EXPERT_TEXT)
+        self.assertFalse({"appeal_id", "approved_at", "revision", "source_url",
+                          "excerpt_start", "excerpt_end"} & sent.keys())
         self.assertIn("Разъяснение службы качества", reply["result"]["text"])
         self.assertEqual(reply["sources"][0]["appeal_id"], card["id"])
         self.assertEqual(reply["sources"][0]["approved_at"], published["publication"]["approved_at"])
@@ -337,9 +341,8 @@ class QualityTests(unittest.TestCase):
         for implicit in (True, False):
             with self.subTest(implicit=implicit):
                 config, appeal = self.smtp_fixture(implicit)
-                # An empty platform trust store reproduces the macOS Python setup.
                 context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                self.assertEqual(context.cert_store_stats()["x509_ca"], 0)
+                initial_ca_count = context.cert_store_stats()["x509_ca"]
                 with (patch("backend.quality_mail.ssl.create_default_context", return_value=context),
                       patch("backend.quality_mail.smtplib.SMTP_SSL") as ssl_connect,
                       patch("backend.quality_mail.smtplib.SMTP") as connect):
@@ -347,7 +350,7 @@ class QualityTests(unittest.TestCase):
 
                 self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
                 self.assertTrue(context.check_hostname)
-                self.assertGreater(context.cert_store_stats()["x509_ca"], 0)
+                self.assertGreater(context.cert_store_stats()["x509_ca"], initial_ca_count)
                 if implicit:
                     connect.assert_not_called()
                     ssl_connect.assert_called_once_with("stub.invalid", 465, timeout=10, context=context)

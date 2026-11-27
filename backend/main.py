@@ -150,11 +150,21 @@ class ApiPrefix:
         await self.app(scope, receive, send)
 
 
-def _bounded_env(name: str, default: int, lower: int, upper: int) -> int:
-    value = int(os.environ.get(name, default))
+def _bounded_env(name: str, default: int, lower: int, upper: int, *, config=None) -> int:
+    value = int((os.environ if config is None else config).get(name, default))
     if not lower <= value <= upper:
         raise ValueError(f"{name} must be between {lower} and {upper}")
     return value
+
+
+def require_corporate_endpoint(settings: LLMSettings, allow_proxyapi: bool) -> None:
+    if allow_proxyapi:
+        if (settings.base_url.rstrip("/") == "https://api.proxyapi.ru/v1"
+                and settings.model == "qwen/qwen3-30b-a3b-instruct-2507"):
+            return
+        raise ValueError("Corporate ProxyAPI requires the approved HTTPS endpoint and Qwen model.")
+    if urlsplit(settings.base_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("Corporate retrieval requires a local endpoint in this server configuration.")
 
 
 def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None,
@@ -163,16 +173,21 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
                retrieval_factory: Callable[[ExpertPublicationLookup], Retrieval] | None = None,
                quality_secret: str | None = None, quality_actor: str = "quality-admin",
                mailer=None, load_quality_env: bool = False, workers: bool = True,
-               frontend_dir: Path | None = None) -> FastAPI:
+               frontend_dir: Path | None = None,
+               catalogue: Callable[[], list[dict]] | None = None,
+               model_is_fixture: bool = False, allow_corporate_proxyapi: bool = False) -> FastAPI:
     if sum(bool(value) for value in (retrieval is not None, retrieval_factory is not None, demo_mode)) > 1:
         raise ValueError("Select only one retrieval adapter")
     if not 1 <= attempts <= 3 or min(per_minute, daily_attempts) < 1:
         raise ValueError("Invalid limits")
+    if allow_corporate_proxyapi and (demo_mode or model is not None or attempts != 1
+                                   or (retrieval is None and retrieval_factory is None)):
+        raise ValueError("Corporate ProxyAPI requires real retrieval and one managed model attempt.")
     if isinstance(model, LLMClient):
         if model.max_attempts > attempts:
             raise ValueError("The injected LLM exceeds the reserved attempt limit")
-        if not demo_mode and urlsplit(model.settings.base_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
-            raise ValueError("Corporate retrieval requires a local endpoint in this server configuration.")
+        if not demo_mode:
+            require_corporate_endpoint(model.settings, False)
     default_db = "demo.sqlite3" if demo_mode else "agent.sqlite3"
     store = Store(db_path or ROOT / "storage" / default_db, per_minute=per_minute, daily_attempts=daily_attempts)
 
@@ -220,13 +235,18 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
         owned_model = None
         if retrieval is not None and active_model is None:
             settings = LLMSettings.from_env()
-            if not demo_mode and urlsplit(settings.base_url).hostname not in {"localhost", "127.0.0.1", "::1"}:
-                raise RuntimeError("Corporate retrieval requires a local endpoint in this server configuration.")
+            if not demo_mode:
+                try:
+                    require_corporate_endpoint(settings, allow_corporate_proxyapi)
+                except ValueError as exc:
+                    raise RuntimeError(str(exc)) from None
             owned_model = active_model = LLMClient(
-                replace(settings, max_tokens=min(settings.max_tokens, 512), timeout=min(settings.timeout, 40)),
+                replace(settings, max_tokens=min(settings.max_tokens, 768 if allow_corporate_proxyapi else 512),
+                        timeout=min(settings.timeout, 40)),
                 max_attempts=attempts,
             )
-        app.state.agent = Agent(retrieval, active_model, publications or quality) if retrieval and active_model else None
+        app.state.agent = Agent(retrieval, active_model, publications or quality,
+                                require_focus=allow_corporate_proxyapi) if retrieval and active_model else None
         app.state.quality = quality
         stop = asyncio.Event()
         task = asyncio.create_task(run_queue(stop)) if workers else None
@@ -264,7 +284,17 @@ def create_app(*, retrieval: Retrieval | None = None, model: Model | None = None
     def health():
         with closing(store.connection()) as db:
             db.execute("SELECT 1 FROM dialogues LIMIT 1")
-        return {"status": "ok", "retrieval": mode}
+        result = {"status": "ok", "retrieval": mode}
+        if model_is_fixture:
+            result["model"] = "offline-fixture"
+        elif allow_corporate_proxyapi:
+            result["model"] = "proxyapi-qwen"
+        return result
+
+    if catalogue is not None:
+        @app.get("/knowledge")
+        def knowledge():
+            return {"documents": catalogue()}
 
     @app.post("/dialogues", status_code=201)
     def create_dialogue() -> DialogueCreated:

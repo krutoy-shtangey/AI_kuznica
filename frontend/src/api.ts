@@ -104,7 +104,8 @@ async function request<T>(path: string, options: {
 const pathFor = (dialogue: Dialogue) => '/dialogues/' + encodeURIComponent(dialogue.dialogue_id)
 
 export const api = {
-  health: () => request<{ status: string; retrieval: Mode }>('/health'),
+  health: () => request<{ status: string; retrieval: Mode; model?: 'offline-fixture' | 'proxyapi-qwen' }>('/health'),
+  knowledge: (signal: AbortSignal) => request<{ documents: Source[] }>('/knowledge', { signal }),
   create: () => request<Omit<Dialogue, 'title'>>('/dialogues', { method: 'POST' }),
   history: (dialogue: Dialogue, before?: number, signal?: AbortSignal) =>
     request<History>(pathFor(dialogue) + '/messages?limit=30' + (before ? '&before=' + before : ''),

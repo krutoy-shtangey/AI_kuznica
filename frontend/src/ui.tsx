@@ -71,7 +71,7 @@ export function SourceCard({ source }: { source: Source }) {
       <ChevronDown className="source-chevron" size={16} aria-hidden="true" />
     </summary>
     <div className="source-body">
-      <blockquote>{source.excerpt}</blockquote>
+      {source.excerpt && <blockquote>{source.excerpt}</blockquote>}
       {source.excerpt_partial && <small className="muted">Показан фрагмент пункта</small>}
       <dl className="source-meta">{metadata.map(([label, value]) => value ?
         <div key={label}><dt>{label}</dt><dd>{value}</dd></div> : null)}</dl>
