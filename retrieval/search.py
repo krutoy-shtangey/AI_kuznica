@@ -103,6 +103,7 @@ def ms(start):
 
 class RegulationSearch:
     require_citation = False
+    encode_publications = False
 
     def __init__(self, index="data/index", settings=Settings(), *, encoder=None, aliases=None,
                  reranker: Reranker | None = None, model_root=MODEL_ROOT):
@@ -130,7 +131,7 @@ class RegulationSearch:
         manifest = saved.manifest
         if manifest["version"] < 2:
             raise RetrievalError("Update the local index to extract regulation metadata")
-        if self.settings.mode != "bm25":
+        if self.encode_publications or self.settings.mode != "bm25":
             model_key = (manifest["model"], manifest["revision"])
             encoder = self.encoder
             if self.owns_encoder and (encoder is None or (encoder.model, encoder.revision) != model_key):
@@ -155,7 +156,7 @@ class RegulationSearch:
         self.metadata_counts = {f"missing_{key}": sum(c[key] is None for c in saved.chunks)
                                 for key in ("department", "stage")}
         self.metadata_counts["indexed_chunks"] = len(saved.chunks)
-        if self.settings.mode != "bm25":
+        if self.encode_publications or self.settings.mode != "bm25":
             self.encoder = encoder
         self.saved, self.lexical, self.positions, self.marker = saved, lexical, positions, marker
 
@@ -191,6 +192,64 @@ class RegulationSearch:
             return results, dict(generation=self.saved.manifest["generation"], candidates=self.candidate_details,
                                  relationships=relationships(self.candidate_details))
 
+    def _rank_candidates(self, question, allowed, top_k, metrics, departments, stages, refs):
+        return self._rank(question, allowed, top_k, metrics, self.source_ids, self.saved.chunks,
+                          self.saved.vectors, self.lexical)
+
+    def _rank(self, question, allowed, top_k, metrics, source_ids, chunks, vectors, lexical, *, split_at=None):
+        if not allowed:
+            return [], {}
+        cfg = self.settings
+        depth = max(cfg.depth, top_k)
+        def ranked(scores):
+            return sorted(scores, key=lambda i: (-scores[i], source_ids[i]))
+
+        def shortlist(scores):
+            order = ranked(scores)
+            if split_at is None or top_k < 2 or len(order) <= depth:
+                return order[:depth]
+            kept = order[:depth]
+            lower_type = kept[0] < split_at
+            if all((i < split_at) == lower_type for i in kept):
+                other = next((i for i in order[depth:] if (i < split_at) != lower_type), None)
+                if other is not None:
+                    kept[-1] = other
+            return kept
+
+        rankings = []
+        if lexical is not None:
+            t = perf_counter()
+            scores = lexical.scores(question, allowed, cfg.lexical_coverage)
+            rankings.append((cfg.lexical_weight, shortlist(scores)))
+            metrics.bm25_ms = ms(t)
+        if cfg.mode != "bm25":
+            t = perf_counter()
+            query = self.encoder.encode_queries([question])[0]
+            if (query.shape != (self.encoder.dimension,) or not np.isfinite(query).all()
+                    or not np.isclose(np.linalg.norm(query), 1, atol=1e-4)):
+                raise RetrievalError("Invalid query vector")
+            metrics.embedding_ms = ms(t)
+            t = perf_counter()
+            values = vectors @ query
+            scores = {i: float(values[i]) for i in allowed if values[i] >= cfg.cosine_floor}
+            rankings.append((cfg.semantic_weight, shortlist(scores)))
+            metrics.semantic_ms = ms(t)
+        t = perf_counter()
+        if cfg.mode == "hybrid":
+            scores = fuse(rankings, cfg.rrf_k)
+        order = shortlist(scores)
+        metrics.fusion_ms = ms(t)
+        if self.reranker and order:
+            t = perf_counter()
+            values = self.reranker.score(question, [chunks[i]["index_text"].removeprefix("passage: ") for i in order])
+            if len(values) != len(order) or not all(isfinite(v) for v in values):
+                raise RetrievalError("Invalid reranker output")
+            scores = dict(zip(order, values))
+            order = ranked(scores)
+            metrics.reranking_ms = ms(t)
+
+        return order, scores
+
     def _search(self, question, top_k, departments, stages, metrics):
         chunks, cfg = self.saved.chunks, self.settings
         refs = set(REFERENCE.findall(question))
@@ -202,43 +261,9 @@ class RegulationSearch:
                    and (not departments or c["department"] is None or c["department"] in departments)
                    and (not stages or c["stage"] is None or c["stage"] in stages)
                    and (not refs or refs.intersection({c["section"], *(s["section"] for s in c["spans"])}))}
-        if not allowed:
-            return []
-        depth = max(cfg.depth, top_k)
+        order, scores = self._rank_candidates(question, allowed, top_k, metrics, departments, stages, refs)
         def ranked(scores):
             return sorted(scores, key=lambda i: (-scores[i], self.source_ids[i]))
-
-        rankings = []
-        if self.lexical is not None:
-            t = perf_counter()
-            scores = self.lexical.scores(question, allowed, cfg.lexical_coverage)
-            rankings.append((cfg.lexical_weight, ranked(scores)[:depth]))
-            metrics.bm25_ms = ms(t)
-        if cfg.mode != "bm25":
-            t = perf_counter()
-            query = self.encoder.encode_queries([question])[0]
-            if (query.shape != (self.encoder.dimension,) or not np.isfinite(query).all()
-                    or not np.isclose(np.linalg.norm(query), 1, atol=1e-4)):
-                raise RetrievalError("Invalid query vector")
-            metrics.embedding_ms = ms(t)
-            t = perf_counter()
-            values = self.saved.vectors @ query
-            scores = {i: float(values[i]) for i in allowed if values[i] >= cfg.cosine_floor}
-            rankings.append((cfg.semantic_weight, ranked(scores)[:depth]))
-            metrics.semantic_ms = ms(t)
-        t = perf_counter()
-        if cfg.mode == "hybrid":
-            scores = fuse(rankings, cfg.rrf_k)
-        order = ranked(scores)[:depth]
-        metrics.fusion_ms = ms(t)
-        if self.reranker and order:
-            t = perf_counter()
-            values = self.reranker.score(question, [chunks[i]["index_text"].removeprefix("passage: ") for i in order])
-            if len(values) != len(order) or not all(isfinite(v) for v in values):
-                raise RetrievalError("Invalid reranker output")
-            scores = dict(zip(order, values))
-            order = ranked(scores)
-            metrics.reranking_ms = ms(t)
 
         # Reserve a candidate for each applicable known scope before filling spare slots.
         first = {}
