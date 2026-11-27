@@ -1,7 +1,8 @@
 """Offline search over regulations. One instance per application, safe to share across threads."""
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from datetime import date
 from getpass import getpass
 import json
 from math import isfinite
@@ -13,10 +14,12 @@ from typing import Protocol
 
 import numpy as np
 
-from shared.contracts import RetrievalError, ScopeFilter, SearchResult, SourceStatus, SourceType
+from shared.contracts import (INITIAL_DEPARTMENT_IDS, INITIAL_STAGE_IDS, RetrievalError,
+                              ScopeFilter, SearchResult, SourceStatus, SourceType)
 from .bm25 import BM25
-from .embeddings import Encoder
+from .embeddings import MODEL_ROOT, Encoder
 from .index import load_index
+from .metadata import lifecycle, relationships
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,7 @@ class Settings:
     depth: int = 32
     context_chars: int = 6000
     neighbors: bool = False
+    include_history: bool = False
 
     def __post_init__(self):
         if (self.mode not in ("bm25", "semantic", "hybrid")
@@ -98,12 +102,15 @@ def ms(start):
 
 
 class RegulationSearch:
+    require_citation = False
+
     def __init__(self, index="data/index", settings=Settings(), *, encoder=None, aliases=None,
-                 reranker: Reranker | None = None):
+                 reranker: Reranker | None = None, model_root=MODEL_ROOT):
         start = perf_counter()
         self.root, self.settings = Path(index), settings
         self.encoder, self.aliases, self.reranker = encoder, dict(aliases or {}), reranker
         self.owns_encoder = encoder is None
+        self.model_root = model_root
         self.lock = RLock()
         self.marker = None
         self.metrics = Timings()
@@ -118,16 +125,33 @@ class RegulationSearch:
         if marker == self.marker:
             return
         saved = load_index(self.root)
+        if any(c["source_type"] != SourceType.REGULATION for c in saved.chunks):
+            raise RetrievalError("Unexpected source type in the regulation index")
         manifest = saved.manifest
+        if manifest["version"] < 2:
+            raise RetrievalError("Update the local index to extract regulation metadata")
         if self.settings.mode != "bm25":
             model_key = (manifest["model"], manifest["revision"])
             encoder = self.encoder
             if self.owns_encoder and (encoder is None or (encoder.model, encoder.revision) != model_key):
-                encoder = Encoder(model=model_key[0], revision=model_key[1])
+                encoder = Encoder(model=model_key[0], revision=model_key[1], model_root=self.model_root)
             if (encoder.model, encoder.revision, encoder.dimension) != (*model_key, manifest["dimension"]):
                 raise RetrievalError("Index requires a different query encoder")
         lexical = BM25(saved.chunks, self.aliases) if self.settings.mode != "semantic" else None
         positions = {(c["document_id"], c["order"]): i for i, c in enumerate(saved.chunks)}
+        paths = defaultdict(set)
+        for c in saved.chunks:
+            paths[c["document_id"], c["section"]].add(tuple(t for _, t in c["headings"]))
+        citations = []
+        for c in saved.chunks:
+            section = c["section"]
+            if section and len(paths[c["document_id"], section]) > 1:
+                section = " / ".join([*(t for _, t in c["headings"]), section])
+            citations.append(f"regulation:{c['document_id']}:{section}" if section else None)
+        counts = Counter(citations)
+        self.citations = citations
+        self.source_ids = [ref if ref and counts[ref] == 1 else c["source_id"]
+                           for ref, c in zip(citations, saved.chunks)]
         self.metadata_counts = {f"missing_{key}": sum(c[key] is None for c in saved.chunks)
                                 for key in ("department", "stage")}
         self.metadata_counts["indexed_chunks"] = len(saved.chunks)
@@ -140,6 +164,8 @@ class RegulationSearch:
         if not isinstance(question, str) or not question.strip() or type(top_k) is not int or top_k < 1:
             raise ValueError("Expected a nonempty question and positive integer top_k")
         departments, stages = scope(department), scope(stage)
+        if set(departments) - set(INITIAL_DEPARTMENT_IDS) or set(stages) - set(INITIAL_STAGE_IDS):
+            raise ValueError("Unknown scope ID")
         start = perf_counter()
         with self.lock:
             metrics = Timings()
@@ -147,6 +173,7 @@ class RegulationSearch:
                 self._refresh()
                 if self.settings.mode != "bm25" and self.encoder.count("query: " + question) > self.encoder.limit:
                     raise LongQuery("Question exceeds E5 input limit; split it into complete questions")
+                self.candidate_details = []
                 results = self._search(question, top_k, departments, stages, metrics)
             except LongQuery:
                 raise
@@ -157,18 +184,29 @@ class RegulationSearch:
                 self.metrics = metrics
             return results
 
+    def search_with_context(self, question, top_k=8, department=None, stage=None):
+        """Return contract results and local metadata for eligible alternatives, including overflow."""
+        with self.lock:
+            results = self.search_documents(question, top_k, department, stage)
+            return results, dict(generation=self.saved.manifest["generation"], candidates=self.candidate_details,
+                                 relationships=relationships(self.candidate_details))
+
     def _search(self, question, top_k, departments, stages, metrics):
         chunks, cfg = self.saved.chunks, self.settings
         refs = set(REFERENCE.findall(question))
+        today = date.today()
+        states = [lifecycle(c["regulation"], today) for c in chunks]
         allowed = {i for i, c in enumerate(chunks)
-                   if (not departments or c["department"] is None or c["department"] in departments)
+                   if (not self.require_citation or self.citations[i])
+                   and (cfg.include_history or states[i] in ("unknown", "approved"))
+                   and (not departments or c["department"] is None or c["department"] in departments)
                    and (not stages or c["stage"] is None or c["stage"] in stages)
                    and (not refs or refs.intersection({c["section"], *(s["section"] for s in c["spans"])}))}
         if not allowed:
             return []
         depth = max(cfg.depth, top_k)
         def ranked(scores):
-            return sorted(scores, key=lambda i: (-scores[i], chunks[i]["source_id"]))
+            return sorted(scores, key=lambda i: (-scores[i], self.source_ids[i]))
 
         rankings = []
         if self.lexical is not None:
@@ -206,14 +244,20 @@ class RegulationSearch:
         first = {}
         for i in order:
             c = chunks[i]
-            key = (c["department"], c["stage"])
+            fields = c["regulation"]["fields"]
+            key = (c["department"], c["stage"], fields.get("process"), fields.get("business"),
+                   fields.get("scope"), c["document_id"])
             first.setdefault(key, i)
         priority = list(dict.fromkeys([*first.values(), *order]))
         chosen = {}
+        chosen_citations = set()
         def include(i, score):
+            if self.require_citation and self.citations[i] in chosen_citations:
+                return False
             size = len(chunks[i]["text"])
             if i not in chosen and len(chosen) < top_k and metrics.context_chars + size <= cfg.context_chars:
                 chosen[i] = score
+                chosen_citations.add(self.citations[i])
                 metrics.context_chars += size
                 return True
             return False
@@ -230,11 +274,25 @@ class RegulationSearch:
                                 and CONDITION.search(n["text"])):
                             include(j, min(chosen.values()))
         results = []
+        for i in dict.fromkeys([*order, *chosen]):
+            c = chunks[i]
+            fields = dict(c["regulation"]["fields"])
+            record = self.saved.manifest["profiles"][c["document_id"]]
+            source_id = self.citations[i] if self.require_citation else self.source_ids[i]
+            self.candidate_details.append(dict(source_id=source_id, citation_id=self.citations[i],
+                chunk_id=c["source_id"], document_id=c["document_id"],
+                section=c["section"], lifecycle=states[i], fields=fields, selected=i in chosen,
+                chunk_sha256=c["checksum"], document_sha256=c["document_sha256"],
+                validity_basis=c["regulation"]["guards"], headings=c["headings"],
+                reviewer=record["reviewer"], basis=record["basis"]))
         for i in ranked(chosen):
             c = chunks[i]
-            results.append(SearchResult(source_id=c["source_id"], document_id=c["document_id"],
-                                        source_type=SourceType(c["source_type"]), status=SourceStatus(c["status"]),
-                                        document=c["document"], text=c["text"], section=c["section"],
+            source_id = self.citations[i] if self.require_citation else self.source_ids[i]
+            section = source_id.removeprefix(f"regulation:{c['document_id']}:") if self.require_citation else c["section"]
+            results.append(SearchResult(source_id=source_id, document_id=c["document_id"],
+                                        source_type=SourceType(c["source_type"]),
+                                        status=SourceStatus.APPROVED if states[i] == "approved" else SourceStatus.UNKNOWN,
+                                        document=c["document"], text=c["text"], section=section,
                                         department=c["department"], stage=c["stage"], score=float(chosen[i]),
                                         source_url=c.get("source_url")))
         metrics.returned = len(results)
@@ -257,6 +315,7 @@ def main():
     parser.add_argument("--lexical-coverage", type=float, default=Settings.lexical_coverage)
     parser.add_argument("--show", action="store_true", help="display source text locally")
     parser.add_argument("--neighbors", action="store_true")
+    parser.add_argument("--include-history", action="store_true", help="also include ineligible and review-only sources")
     parser.add_argument("--aliases", type=Path, help="local JSON object mapping approved variants to terms")
     args = parser.parse_args()
     try:
@@ -264,13 +323,15 @@ def main():
         if not isinstance(aliases, dict) or not all(isinstance(v, str) and v.strip() for v in aliases.values()):
             raise ValueError("Invalid alias dictionary")
         settings = Settings(mode=args.mode, context_chars=args.context_chars, neighbors=args.neighbors,
+                            include_history=args.include_history,
                             cosine_floor=args.cosine_floor, lexical_coverage=args.lexical_coverage)
         search = RegulationSearch(args.index, settings, aliases=aliases)
-        items = search.search_documents(getpass("Вопрос: "), args.top_k, tuple(args.department or ()) or None,
-                                        tuple(args.stage or ()) or None)
+        items, context = search.search_with_context(getpass("Вопрос: "), args.top_k, tuple(args.department or ()) or None,
+                                                     tuple(args.stage or ()) or None)
         output = dict(**asdict(search.metrics), **search.metadata_counts, cold_ms=search.cold_ms)
         if args.show:
             output["results"] = [asdict(item) for item in items]
+            output["context"] = context
         print(json.dumps(output, ensure_ascii=False))
         return 0
     except LongQuery:
