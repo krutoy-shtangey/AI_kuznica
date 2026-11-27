@@ -1,10 +1,10 @@
-import { BarChart3, BookOpen, ChevronRight, Database, Layers3, Menu, MessageSquare, PanelLeftClose, Plus, Search, ShieldCheck } from 'lucide-react'
+import { BarChart3, BookOpen, Database, Menu, MessageSquare, PanelLeftOpen, PanelLeftClose, Plus, Search, ShieldCheck } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api'
 import type { Dialogue, Mode, PublicAppeal, Source, Usage } from './api'
 import Chat from './Chat'
 import Quality from './Quality'
-import { errorText, Notice, SourceCard, UsageCards } from './ui'
+import { BrandMark, errorText, Notice, SourceCard, UsageCards } from './ui'
 
 const sections = [
   { id: 'chat', title: 'ИИ-ассистент', icon: MessageSquare },
@@ -39,6 +39,8 @@ export default function App() {
   const [mode, setMode] = useState<Mode | null>(null)
   const [healthError, setHealthError] = useState(false)
   const [drawer, setDrawer] = useState(false)
+  const [collapsed, setCollapsed] = useState(false)
+  const desktopToggle = useRef<HTMLButtonElement>(null)
   const [secret, setSecret] = useState<string | null>(null)
   const [usage, setUsage] = useState<Record<string, Usage>>({})
   const [createError, setCreateError] = useState('')
@@ -123,13 +125,14 @@ export default function App() {
     return { ...old, appeals: { ...old.appeals, [key]: value } }
   }), [])
 
-  return <div className="app-shell">
+  return <div className={'app-shell' + (collapsed ? ' sidebar-collapsed' : '')}>
     <a className="skip-link" href="#content" onClick={(event) => { event.preventDefault(); document.getElementById('content')?.focus() }}>К содержимому</a>
     {drawer && <button className="drawer-backdrop" aria-label="Закрыть меню" tabIndex={-1}
       onClick={() => { setDrawer(false); navToggle.current?.focus() }} />}
     <aside className={'sidebar' + (drawer ? ' open' : '')} id="sidebar" ref={sidebar}>
-      <div className="brand"><span className="brand-icon"><Layers3 size={21} strokeWidth={2} /></span>
-        <div><strong>Reglament AI</strong><small>Рабочее пространство</small></div>
+      <div className="brand"><BrandMark /><strong>Reglament AI</strong>
+        <button className="icon-button desktop-collapse" aria-label="Свернуть боковую панель" title="Свернуть боковую панель"
+          onClick={() => { setCollapsed(true); requestAnimationFrame(() => desktopToggle.current?.focus()) }}><PanelLeftClose size={18} /></button>
         <button className="icon-button drawer-close" ref={closeToggle} aria-label="Закрыть навигацию"
           onClick={() => { setDrawer(false); navToggle.current?.focus() }}><PanelLeftClose size={19} /></button>
       </div>
@@ -143,14 +146,14 @@ export default function App() {
         </button>
         <p className="side-heading">Диалоги</p>
         <div className="dialogue-list">
-          {!data.dialogues.length && <p className="empty-list">Здесь появятся ваши диалоги</p>}
+          {!data.dialogues.length && <p className="empty-list">Диалогов пока нет</p>}
           {data.dialogues.map((d) => <button key={d.dialogue_id} onClick={() => select(d.dialogue_id)}
             aria-current={page === 'chat' && d.dialogue_id === current?.dialogue_id ? 'true' : undefined} title={d.title}>
             <MessageSquare size={15} /><span>{d.title}</span>
           </button>)}
         </div>
       </div>
-      <div className="sidebar-status"><span className={'status-dot ' + (healthError || mode === 'disabled' ? 'inactive' : '')} />
+      <div className={'sidebar-status' + (mode === 'demo' ? ' demo-status' : '')}><span className={'status-dot ' + (healthError || mode === 'disabled' ? 'inactive' : '')} />
         {healthError ? 'Нет связи с сервером' : mode === 'demo' ? 'Демонстрационный режим' : mode === 'configured' ? 'Поиск подключён' : mode === 'disabled' ? 'Поиск не подключён' : 'Проверяем подключение…'}
       </div>
     </aside>
@@ -158,8 +161,14 @@ export default function App() {
       <header className="topbar">
         <button className="icon-button mobile-menu" ref={navToggle} aria-expanded={drawer} aria-controls="sidebar"
           aria-label="Открыть навигацию" onClick={() => setDrawer(!drawer)}><Menu size={23} /></button>
-        <div className="breadcrumb"><span>Рабочее пространство</span><ChevronRight size={14} /><strong>{activeSection.title}</strong></div>
-        {page === 'chat' && <button className="button header-metrics" onClick={() => navigate('analytics')}><BarChart3 size={16} /> <span>Метрики диалога</span></button>}
+        {collapsed && <button className="icon-button desktop-expand" ref={desktopToggle} aria-label="Развернуть боковую панель"
+          title="Развернуть боковую панель" onClick={() => {
+            setCollapsed(false)
+            requestAnimationFrame(() => sidebar.current?.querySelector<HTMLButtonElement>('.desktop-collapse')?.focus())
+          }}><PanelLeftOpen size={20} /></button>}
+        <div className="breadcrumb"><strong>{activeSection.title}</strong></div>
+        {mode === 'demo' && <span className="top-demo" aria-label="Демонстрационный режим">Демо</span>}
+        {page === 'chat' && <button className="button header-metrics" aria-label="Метрики диалога" onClick={() => navigate('analytics')}><BarChart3 size={16} /> <span>Метрики диалога</span></button>}
       </header>
       {(createError || storageError) && <div className="global-notice"><Notice tone="error">
         {createError || 'Не удалось сохранить список диалогов в браузере.'}
