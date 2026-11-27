@@ -1,0 +1,34 @@
+{
+  "format": 1,
+  "documents": {
+    "Синтетический стенд.docx": {
+      "id": "demo-stand",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "reviewer": "Учебный рецензент",
+      "basis": "Синтетический пример. Для рабочего реестра требуется SHA-256 фактической редакции и основание проверки.",
+      "fields": {
+        "title": "Учебные испытания",
+        "registration": "DEMO-42",
+        "version": "2.1",
+        "approved_on": "2025-01-15",
+        "valid_from": "2025-02-01",
+        "department": "tech",
+        "stage": "implementation",
+        "business": "Учебные стенды",
+        "process": "Приёмка макета",
+        "scope": "Проверка учебных образцов",
+        "state": "approved"
+      },
+      "sections": {
+        "4": {
+          "state": "replaced",
+          "replaced_by": "demo-successor",
+          "change_on": "2025-04-01"
+        },
+        "2.1": {
+          "department": "ib"
+        }
+      }
+    }
+  }
+}

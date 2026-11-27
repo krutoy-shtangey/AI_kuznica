@@ -38,3 +38,5 @@ backups/
 
 .idea/
 .vscode/
+# Local regulation documents
+*.[dD][oO][cC][xX]
