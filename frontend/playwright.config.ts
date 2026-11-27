@@ -6,6 +6,7 @@ const root = fileURLToPath(new URL('..', import.meta.url))
 const api = 'http://127.0.0.1:8117'
 const site = 'http://127.0.0.1:5178'
 const secret = 'frontend-local-test-only-secret-0987654321'
+const python = process.platform === 'win32' ? '.venv/Scripts/python.exe' : '.venv/bin/python'
 process.env.UI_TEST_ADMIN_SECRET = secret
 
 export default defineConfig({
@@ -23,7 +24,7 @@ export default defineConfig({
     },
   },
   webServer: [
-    { command: '.venv/bin/python -B frontend/tests/local_api.py', cwd: root, url: api + '/health',
+    { command: `"${python}" -B frontend/tests/local_api.py`, cwd: root, url: api + '/health',
       env: { UI_TEST_ADMIN_SECRET: secret }, reuseExistingServer: false },
     { command: 'npm run dev -- --port 5178 --strictPort', cwd: frontend, url: site,
       env: { API_PROXY_TARGET: api }, reuseExistingServer: false },
