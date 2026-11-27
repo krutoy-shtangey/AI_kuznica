@@ -1,0 +1,27 @@
+[Unit]
+Description=Reglament AI
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=reglament
+Group=reglament
+WorkingDirectory=/opt/reglament-ai/current
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+EnvironmentFile=/etc/reglament-ai/app.env
+ExecStart=/opt/reglament-ai/current/.venv/bin/python -m uvicorn deploy.app:create_application --factory --host 127.0.0.1 --port 8000 --workers 1 --no-access-log --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=120s
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/reglament-ai/storage /var/lib/reglament-ai/index
+
+[Install]
+WantedBy=multi-user.target

@@ -1,3 +1,4 @@
+import ssl
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -322,18 +323,63 @@ class QualityTests(unittest.TestCase):
         turn = client.get(path + "/messages", headers=bearer).json()["messages"][0]["id"]
         self.appeal(client, dialogue, turn, 409)
 
-    def test_smtp_transport_uses_fixed_envelope_and_tls(self):
-        config = SMTPSettings("stub.invalid", 587, "quality", "fake", "sender@example.invalid",
-                              "quality@example.invalid", True, False, "https://demo.example.invalid")
-        with patch("backend.quality_mail.smtplib.SMTP") as connect:
-            SMTPMailer(config).send({
-                "id": "demo", "question": QUESTION, "reason": "NO_ANSWER", "clarifications": (),
-                "facts": {}, "department": None, "stage": None,
-            })
-        smtp = connect.return_value
-        smtp.starttls.assert_called_once()
-        smtp.login.assert_called_once()
-        message = smtp.send_message.call_args.args[0]
-        self.assertEqual(smtp.send_message.call_args.kwargs["to_addrs"], ["quality@example.invalid"])
-        self.assertIn("https://demo.example.invalid/docs", message.get_content())
-        self.assertEqual(message["Message-ID"], "<quality-demo@example.invalid>")
+    @staticmethod
+    def smtp_fixture(implicit):
+        return (
+            SMTPSettings("stub.invalid", 465 if implicit else 587, "quality", "fake",
+                         "sender@example.invalid", "quality@example.invalid", not implicit, implicit,
+                         "https://demo.example.invalid"),
+            {"id": "demo", "question": QUESTION, "reason": "NO_ANSWER", "clarifications": (),
+             "facts": {}, "department": None, "stage": None},
+        )
+
+    def test_smtp_modes_load_trusted_cas_and_use_a_fixed_envelope(self):
+        for implicit in (True, False):
+            with self.subTest(implicit=implicit):
+                config, appeal = self.smtp_fixture(implicit)
+                # An empty platform trust store reproduces the macOS Python setup.
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                self.assertEqual(context.cert_store_stats()["x509_ca"], 0)
+                with (patch("backend.quality_mail.ssl.create_default_context", return_value=context),
+                      patch("backend.quality_mail.smtplib.SMTP_SSL") as ssl_connect,
+                      patch("backend.quality_mail.smtplib.SMTP") as connect):
+                    SMTPMailer(config).send(appeal)
+
+                self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+                self.assertTrue(context.check_hostname)
+                self.assertGreater(context.cert_store_stats()["x509_ca"], 0)
+                if implicit:
+                    connect.assert_not_called()
+                    ssl_connect.assert_called_once_with("stub.invalid", 465, timeout=10, context=context)
+                    smtp = ssl_connect.return_value
+                else:
+                    ssl_connect.assert_not_called()
+                    connect.assert_called_once_with("stub.invalid", 587, timeout=10)
+                    smtp = connect.return_value
+                    smtp.starttls.assert_called_once_with(context=context)
+
+                calls = [call[0] for call in smtp.method_calls]
+                if not implicit:
+                    self.assertLess(calls.index("starttls"), calls.index("login"))
+                self.assertLess(calls.index("login"), calls.index("send_message"))
+                message = smtp.send_message.call_args.args[0]
+                self.assertEqual(smtp.send_message.call_args.kwargs["to_addrs"], ["quality@example.invalid"])
+                self.assertIn("https://demo.example.invalid/docs", message.get_content())
+                self.assertEqual(message["Message-ID"], "<quality-demo@example.invalid>")
+
+    def test_smtp_certificate_failure_never_authenticates_or_sends(self):
+        for implicit in (True, False):
+            with self.subTest(implicit=implicit):
+                config, appeal = self.smtp_fixture(implicit)
+                with (patch("backend.quality_mail.smtplib.SMTP_SSL") as ssl_connect,
+                      patch("backend.quality_mail.smtplib.SMTP") as connect):
+                    error = ssl.SSLCertVerificationError("synthetic certificate failure")
+                    if implicit:
+                        ssl_connect.side_effect = error
+                    else:
+                        connect.return_value.starttls.side_effect = error
+                    with self.assertRaises(MailRetry):
+                        SMTPMailer(config).send(appeal)
+                    for constructor in (ssl_connect, connect):
+                        constructor.return_value.login.assert_not_called()
+                        constructor.return_value.send_message.assert_not_called()

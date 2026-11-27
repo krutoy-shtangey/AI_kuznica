@@ -98,3 +98,7 @@ npm --prefix frontend test
 ```
 
 Первый запуск браузерных тестов требует предварительной production-сборки. При наличии установленного Google Chrome можно использовать `UI_TEST_CHROME=1 npm --prefix frontend test`.
+
+## Развёртывание на VPS
+
+Инструкция для Ubuntu 24.04, файлы systemd и Nginx, подготовка CPU-поиска и команды резервного копирования находятся в [deploy/README.md](deploy/README.md).
