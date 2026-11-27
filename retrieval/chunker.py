@@ -105,7 +105,8 @@ def chunk_document(document, encoder, config=Config()):
                            spans=spans, document_sha256=meta.checksum,
                            checksum=sha256(original.encode()).hexdigest(), tokens=tokens))
 
-    for (_, path), siblings in groupby(units(document), key=lambda unit: (unit.group, unit.block.headings)):
+    for (_, path, _section), siblings in groupby(
+            units(document), key=lambda unit: (unit.group, unit.block.headings, unit.block.section)):
         pending = []
         # Keep complete nearby titles when they fit. Every title is also indexed
         # as an original element, and the full path remains available for citation.

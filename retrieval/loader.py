@@ -116,12 +116,14 @@ class Reader:
         element.shape = len(table.rows), len(table.columns)
 
 
-def load_directory(directory, *, document_ids=None, scopes=None, statuses=None, known_checksums=None):
+def load_directory(directory, *, document_ids=None, scopes=None, statuses=None, known_checksums=None,
+                   ids_by_checksum=None):
     """Mappings keyed by exact filename may supply verified metadata from the caller."""
     batch = Batch()
     seen = set()
     try:
-        paths = sorted(Path(directory).iterdir(), key=lambda p: (p.name.casefold(), p.name))
+        paths = sorted(Path(directory).iterdir(), key=lambda p: (
+            p.name not in (document_ids or {}), p.name.casefold(), p.name))
     except OSError:
         batch.errors += 1
         return batch
@@ -137,7 +139,7 @@ def load_directory(directory, *, document_ids=None, scopes=None, statuses=None, 
             if checksum in seen:
                 batch.duplicates += 1
                 continue
-            identifier = (document_ids or {}).get(path.name) or str(
+            identifier = (document_ids or {}).get(path.name) or (ids_by_checksum or {}).get(checksum) or str(
                 uuid5(NAMESPACE_URL, "AI_kuznica/regulation/" + path.name.casefold()))
             meta = Metadata(identifier, path.name, checksum,
                             (scopes or {}).get(path.name, ApplicabilityScope()),

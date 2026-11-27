@@ -18,6 +18,7 @@ import numpy as np
 from .chunker import Config, chunk_document
 from .embeddings import Encoder, MODEL, MODEL_ROOT, REVISION
 from .loader import load_directory
+from . import metadata
 
 
 class IndexErrorLocal(Exception):
@@ -56,7 +57,7 @@ def read_snapshot(root, pointer_path=None):
         if digest(manifest_file) != pointer["sha256"]:
             raise ValueError
         manifest = json.loads(manifest_file.read_bytes())
-        if manifest["version"] != 1 or manifest["generation"] != generation:
+        if manifest["version"] not in (1, 2) or manifest["generation"] != generation:
             raise ValueError
         for name in ("chunks.json", "embeddings.npy"):
             if digest(folder / name) != manifest["hashes"][name]:
@@ -120,7 +121,7 @@ def publish(root, manifest, chunks, vectors, old):
 
 
 def update_index(documents, directory, encoder, config=Config(), force=False, *,
-                 document_ids=None, scopes=None, statuses=None):
+                 document_ids=None, scopes=None, statuses=None, registry=None):
     started = perf_counter()
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
@@ -132,11 +133,17 @@ def update_index(documents, directory, encoder, config=Config(), force=False, *,
             except IndexErrorLocal:
                 if not force:
                     raise
-        identity = dict(version=1, algorithm=1, model=encoder.model, revision=encoder.revision,
+        entries = metadata.read_registry(registry)
+        by_hash = {v["sha256"]: v for v in entries.values()}
+        if old and old.manifest.get("registry_managed") and registry is None:
+            raise IndexErrorLocal("registry_required")
+        identifiers = {**(document_ids or {}), **{k: v["id"] for k, v in entries.items()}}
+        identity = dict(version=2, algorithm=2, model=encoder.model, revision=encoder.revision,
                         dimension=encoder.dimension, chunking=asdict(config))
         compatible = old and not force and all(old.manifest[k] == v for k, v in identity.items())
         known = old.manifest["documents"] if compatible else {}
-        batch = load_directory(documents, known_checksums=known, document_ids=document_ids,
+        batch = load_directory(documents, known_checksums=known, document_ids=identifiers,
+                               ids_by_checksum={k: v["id"] for k, v in by_hash.items()},
                                scopes=scopes, statuses=statuses)
         if batch.errors:
             raise IndexErrorLocal(f"source_read_errors={batch.errors}; update_aborted")
@@ -145,7 +152,7 @@ def update_index(documents, directory, encoder, config=Config(), force=False, *,
         if len(checksums) != len(batch.reused) + len(batch.documents):
             raise IndexErrorLocal("duplicate_document_id")
         unchanged = {meta.document_id: meta for meta in batch.reused}
-        metadata_changed = False
+        profiles = {}
         previous_rows = defaultdict(list)
         if compatible:
             for i, chunk in enumerate(old.chunks):
@@ -156,13 +163,15 @@ def update_index(documents, directory, encoder, config=Config(), force=False, *,
         # Stable ordering across incremental and clean builds.
         fresh = {doc.metadata.document_id: doc for doc in batch.documents}
         for doc_id in sorted(checksums):
+            meta = fresh[doc_id].metadata if doc_id in fresh else unchanged[doc_id]
+            evidence = (metadata.extract(fresh[doc_id]) if doc_id in fresh else
+                        old.manifest["profiles"][doc_id]["evidence"])
+            profiles[doc_id] = metadata.profile(meta, evidence, entries.get(meta.filename) or by_hash.get(meta.checksum))
             if doc_id not in fresh:
                 rows = previous_rows[doc_id]
                 meta = unchanged[doc_id]
                 for i in rows:
-                    chunk = dict(old.chunks[i], document=meta.filename, department=meta.scope.department,
-                                 stage=meta.scope.stage, status=meta.status.value)
-                    metadata_changed |= chunk != old.chunks[i]
+                    chunk = dict(old.chunks[i], document=meta.filename)
                     chunks.append(chunk)
                 arrays.append(old.vectors[rows])
                 reused += len(rows)
@@ -172,17 +181,41 @@ def update_index(documents, directory, encoder, config=Config(), force=False, *,
             split_time += perf_counter() - now
             now = perf_counter()
             if items:
-                arrays.append(encoder.encode([item["index_text"] for item in items]))
+                # Reuse identical embedding inputs on metadata-only edits and v1 migration.
+                reusable = {}
+                if old and not force and all(old.manifest[k] == identity[k] for k in
+                                             ("model", "revision", "dimension", "chunking")):
+                    reusable = {c["index_text"]: i for i, c in enumerate(old.chunks)
+                                if c["document_id"] == doc_id or c["document_sha256"] == meta.checksum}
+                missing = [j for j, c in enumerate(items) if c["index_text"] not in reusable]
+                matrix = np.empty((len(items), encoder.dimension), dtype=np.float32)
+                if missing:
+                    encoded = encoder.encode([items[j]["index_text"] for j in missing])
+                    if encoded.shape != (len(missing), encoder.dimension):
+                        raise ValueError("Invalid vector shape")
+                    matrix[missing] = encoded
+                for j, c in enumerate(items):
+                    if c["index_text"] in reusable:
+                        matrix[j] = old.vectors[reusable[c["index_text"]]]
+                        reused += 1
+                arrays.append(matrix)
             embed_time += perf_counter() - now
             chunks.extend(items)
             if old and doc_id in old.manifest["documents"]:
                 updated += len(items)
             else:
                 new += len(items)
-        if not compatible or checksums != known or metadata_changed:
+        for c in chunks:
+            rule = metadata.policy(profiles[c["document_id"]], c["section"], [t for _, t in c["headings"]])
+            fields = rule["fields"]
+            c.update(regulation=rule, department=fields.get("department"), stage=fields.get("stage"),
+                     status="approved" if metadata.lifecycle(rule) == "approved" else "unknown")
+        managed = registry is not None
+        if (not compatible or checksums != known or profiles != old.manifest["profiles"]
+                or managed != old.manifest["registry_managed"]):
             vectors = (np.concatenate(arrays) if arrays else
                        np.empty((0, encoder.dimension), dtype=np.float32))
-            manifest = dict(**identity, documents=checksums, count=len(chunks),
+            manifest = dict(**identity, documents=checksums, profiles=profiles, registry_managed=managed, count=len(chunks),
                             updated_at=datetime.now(timezone.utc).isoformat())
             validate(manifest, chunks, vectors)
             size = publish(root, manifest, chunks, vectors, old)
@@ -201,6 +234,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--documents", type=Path, default=Path("data/documents"))
     parser.add_argument("--index", type=Path, default=Path("data/index"))
+    parser.add_argument("--registry", type=Path)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--force", action="store_true")
@@ -221,7 +255,7 @@ def main():
         else:
             encoder = Encoder(args.model, args.revision, args.batch_size, args.device, args.model_root)
             result = update_index(args.documents, args.index, encoder,
-                                  Config(args.target, args.maximum, args.overlap), args.force)
+                                  Config(args.target, args.maximum, args.overlap), args.force, registry=args.registry)
     except Exception as exc:
         # Parser and IO exceptions can contain document names or text.
         result = dict(errors=1, error=str(exc) if isinstance(exc, IndexErrorLocal) else type(exc).__name__)
