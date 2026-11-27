@@ -56,6 +56,7 @@ class Reader:
 
     def blocks(self, container, parent, headings=(), section=None):
         result = []
+        section_series = None
         for block in body_blocks(container, parent):
             order = next(self.order)
             if isinstance(block, Table):
@@ -67,18 +68,25 @@ class Reader:
                 depth, label, automatic = self.numbering.advance(props, block.style.style_id)
                 text = paragraph_text(block)
                 match = None if DATE_PREFIX.match(text) else CLAUSE.match(text)
-                clause = automatic or ((match[1] or match[2]) if match else None)
-                if outline is not None and 0 <= int(outline) < 9:
+                explicit = (match[1] or match[2]) if match else None
+                heading = outline is not None and 0 <= int(outline) < 9
+                series = inherited(props, "numPr/numId")
+                # A separate list below a clause can restart at "1." or "a."
+                # without introducing a new clause. Keep its label for indexing.
+                local_list = (section is not None and section_series != series
+                              and automatic is not None and "." not in automatic)
+                clause = explicit or (automatic if heading or not local_list else None)
+                if heading:
                     level = int(outline) + 1
                     headings = tuple(h for h in headings if h[0] < level) + ((level, text),)
-                    section = clause
                     kind = "heading"
                 elif depth is not None:
                     kind = "list_item"
                 else:
                     kind = "paragraph"
-                if clause:
+                if clause or heading:
                     section = clause
+                    section_series = series if clause and not explicit else None
                 element = Element(self.meta, order, kind, text, section, headings, label, depth)
             result.append(element)
         return result

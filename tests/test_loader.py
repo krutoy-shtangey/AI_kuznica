@@ -99,6 +99,31 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(blocks[6].kind, "list_item")
         self.assertTrue(blocks[6].label)
 
+    def test_auxiliary_numbering_keeps_parent_clause_and_its_own_labels(self):
+        self.doc.add_paragraph("1.3. Parent procedure:")
+        self.doc.add_paragraph("First action", style="List Number")
+        self.doc.add_paragraph("Condition", style="List Bullet 2")
+        self.doc.add_paragraph("Second action", style="List Number")
+        table = self.doc.add_table(1, 1)
+        table.cell(0, 0).paragraphs[0].style = "List Number"
+        table.cell(0, 0).paragraphs[0].text = "Table action"
+        self.doc.add_paragraph("1.4. Next procedure", style="List Number")
+        self.doc.add_paragraph("Next action", style="List Number")
+        self.doc.add_heading("New heading", 1)
+        self.doc.add_paragraph("Ordinary paragraph")
+        blocks = self.load().blocks
+        self.assertEqual([b.section for b in blocks], ["1.3"] * 5 + ["1.4"] * 2 + [None, None])
+        self.assertEqual((blocks[1].label, blocks[3].label), ("1.", "2."))
+        self.assertEqual(blocks[4].cells[0].blocks[0].section, "1.3")
+
+    def test_auxiliary_list_does_not_replace_automatic_clause(self):
+        self.doc.add_heading("1. Main heading", 1)
+        self.doc.add_paragraph("First action", style="List Number")
+        self.doc.add_paragraph("Second action", style="List Number")
+        self.doc.add_heading("2. Next heading", 1)
+        blocks = self.load().blocks
+        self.assertEqual([b.section for b in blocks], ["1", "1", "1", "2"])
+
     def test_nested_table(self):
         cell = self.doc.add_table(1, 1).cell(0, 0)
         cell.text = "До"

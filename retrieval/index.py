@@ -138,7 +138,7 @@ def update_index(documents, directory, encoder, config=Config(), force=False, *,
         if old and old.manifest.get("registry_managed") and registry is None:
             raise IndexErrorLocal("registry_required")
         identifiers = {**(document_ids or {}), **{k: v["id"] for k, v in entries.items()}}
-        identity = dict(version=2, algorithm=2, model=encoder.model, revision=encoder.revision,
+        identity = dict(version=2, algorithm=3, model=encoder.model, revision=encoder.revision,
                         dimension=encoder.dimension, chunking=asdict(config))
         compatible = old and not force and all(old.manifest[k] == v for k, v in identity.items())
         known = old.manifest["documents"] if compatible else {}
@@ -181,7 +181,7 @@ def update_index(documents, directory, encoder, config=Config(), force=False, *,
             split_time += perf_counter() - now
             now = perf_counter()
             if items:
-                # Reuse identical embedding inputs on metadata-only edits and v1 migration.
+                # Reuse identical embedding inputs after metadata edits or a parser upgrade.
                 reusable = {}
                 if old and not force and all(old.manifest[k] == identity[k] for k in
                                              ("model", "revision", "dimension", "chunking")):

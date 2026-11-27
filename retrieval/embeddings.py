@@ -7,7 +7,7 @@ import numpy as np
 
 MODEL = "intfloat/multilingual-e5-small"
 REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
-MODEL_ROOT = Path(__file__).resolve().parents[1] / "models"
+MODEL_ROOT = Path(os.environ.get("RETRIEVAL_MODEL_ROOT") or Path(__file__).resolve().parents[1] / "models")
 
 
 class Encoder:
