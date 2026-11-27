@@ -17,7 +17,7 @@ import numpy as np
 from shared.contracts import (INITIAL_DEPARTMENT_IDS, INITIAL_STAGE_IDS, RetrievalError,
                               ScopeFilter, SearchResult, SourceStatus, SourceType)
 from .bm25 import BM25
-from .embeddings import Encoder
+from .embeddings import MODEL_ROOT, Encoder
 from .index import load_index
 from .metadata import lifecycle, relationships
 
@@ -102,12 +102,15 @@ def ms(start):
 
 
 class RegulationSearch:
+    require_citation = False
+
     def __init__(self, index="data/index", settings=Settings(), *, encoder=None, aliases=None,
-                 reranker: Reranker | None = None):
+                 reranker: Reranker | None = None, model_root=MODEL_ROOT):
         start = perf_counter()
         self.root, self.settings = Path(index), settings
         self.encoder, self.aliases, self.reranker = encoder, dict(aliases or {}), reranker
         self.owns_encoder = encoder is None
+        self.model_root = model_root
         self.lock = RLock()
         self.marker = None
         self.metrics = Timings()
@@ -122,6 +125,8 @@ class RegulationSearch:
         if marker == self.marker:
             return
         saved = load_index(self.root)
+        if any(c["source_type"] != SourceType.REGULATION for c in saved.chunks):
+            raise RetrievalError("Unexpected source type in the regulation index")
         manifest = saved.manifest
         if manifest["version"] < 2:
             raise RetrievalError("Update the local index to extract regulation metadata")
@@ -129,7 +134,7 @@ class RegulationSearch:
             model_key = (manifest["model"], manifest["revision"])
             encoder = self.encoder
             if self.owns_encoder and (encoder is None or (encoder.model, encoder.revision) != model_key):
-                encoder = Encoder(model=model_key[0], revision=model_key[1])
+                encoder = Encoder(model=model_key[0], revision=model_key[1], model_root=self.model_root)
             if (encoder.model, encoder.revision, encoder.dimension) != (*model_key, manifest["dimension"]):
                 raise RetrievalError("Index requires a different query encoder")
         lexical = BM25(saved.chunks, self.aliases) if self.settings.mode != "semantic" else None
@@ -192,7 +197,8 @@ class RegulationSearch:
         today = date.today()
         states = [lifecycle(c["regulation"], today) for c in chunks]
         allowed = {i for i, c in enumerate(chunks)
-                   if (cfg.include_history or states[i] in ("unknown", "approved"))
+                   if (not self.require_citation or self.citations[i])
+                   and (cfg.include_history or states[i] in ("unknown", "approved"))
                    and (not departments or c["department"] is None or c["department"] in departments)
                    and (not stages or c["stage"] is None or c["stage"] in stages)
                    and (not refs or refs.intersection({c["section"], *(s["section"] for s in c["spans"])}))}
@@ -244,10 +250,14 @@ class RegulationSearch:
             first.setdefault(key, i)
         priority = list(dict.fromkeys([*first.values(), *order]))
         chosen = {}
+        chosen_citations = set()
         def include(i, score):
+            if self.require_citation and self.citations[i] in chosen_citations:
+                return False
             size = len(chunks[i]["text"])
             if i not in chosen and len(chosen) < top_k and metrics.context_chars + size <= cfg.context_chars:
                 chosen[i] = score
+                chosen_citations.add(self.citations[i])
                 metrics.context_chars += size
                 return True
             return False
@@ -268,7 +278,8 @@ class RegulationSearch:
             c = chunks[i]
             fields = dict(c["regulation"]["fields"])
             record = self.saved.manifest["profiles"][c["document_id"]]
-            self.candidate_details.append(dict(source_id=self.source_ids[i], citation_id=self.citations[i],
+            source_id = self.citations[i] if self.require_citation else self.source_ids[i]
+            self.candidate_details.append(dict(source_id=source_id, citation_id=self.citations[i],
                 chunk_id=c["source_id"], document_id=c["document_id"],
                 section=c["section"], lifecycle=states[i], fields=fields, selected=i in chosen,
                 chunk_sha256=c["checksum"], document_sha256=c["document_sha256"],
@@ -276,10 +287,12 @@ class RegulationSearch:
                 reviewer=record["reviewer"], basis=record["basis"]))
         for i in ranked(chosen):
             c = chunks[i]
-            results.append(SearchResult(source_id=self.source_ids[i], document_id=c["document_id"],
+            source_id = self.citations[i] if self.require_citation else self.source_ids[i]
+            section = source_id.removeprefix(f"regulation:{c['document_id']}:") if self.require_citation else c["section"]
+            results.append(SearchResult(source_id=source_id, document_id=c["document_id"],
                                         source_type=SourceType(c["source_type"]),
                                         status=SourceStatus.APPROVED if states[i] == "approved" else SourceStatus.UNKNOWN,
-                                        document=c["document"], text=c["text"], section=c["section"],
+                                        document=c["document"], text=c["text"], section=section,
                                         department=c["department"], stage=c["stage"], score=float(chosen[i]),
                                         source_url=c.get("source_url")))
         metrics.returned = len(results)
