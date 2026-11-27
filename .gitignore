@@ -32,6 +32,9 @@ logs/
 
 .DS_Store
 Thumbs.db
+*.zip
+backups/
+.tools/
 
 .idea/
 .vscode/

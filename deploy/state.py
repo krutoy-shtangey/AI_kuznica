@@ -6,7 +6,7 @@ import os
 from pathlib import Path, PurePosixPath
 import sqlite3
 import tarfile
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import TemporaryDirectory
 
 AREAS = ("storage", "documents", "index", "models")
 SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
@@ -47,15 +47,17 @@ def backup(state, archive):
                 check_db(copy)
                 copy.execute("PRAGMA journal_mode=DELETE")
 
-        with NamedTemporaryFile(dir=scratch) as snapshot:
+        # Close before publishing: Windows does not share NamedTemporaryFile handles.
+        snapshot_path = scratch / "snapshot.tar.gz"
+        with snapshot_path.open("wb") as snapshot:
             with tarfile.open(fileobj=snapshot, mode="w:gz", compresslevel=3) as bundle:
                 bundle.add(storage, arcname="storage")
                 for name in AREAS[1:]:
                     bundle.add(state / name, arcname=name)
             snapshot.flush()
             os.fsync(snapshot.fileno())
-            # Publish the archive atomically and never replace an earlier backup.
-            os.link(snapshot.name, archive)
+        # Publish the archive atomically and never replace an earlier backup.
+        os.link(snapshot_path, archive)
 
 
 def safe_members(bundle):
@@ -63,6 +65,7 @@ def safe_members(bundle):
     for member in bundle:
         name = PurePosixPath(member.name)
         if (name.is_absolute() or not name.parts or ".." in name.parts
+                or "\\" in member.name or ":" in member.name
                 or name.parts[0] not in AREAS or name in seen
                 or not (member.isfile() or member.isdir())
                 or len(name.parts) == 1 and not member.isdir()):
