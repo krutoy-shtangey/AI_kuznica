@@ -41,6 +41,8 @@ class SMTPSettings:
     tls: bool
     ssl: bool
     public_url: str | None
+    min_interval_seconds: int = 300
+    summary_only: bool = False
 
     @classmethod
     def load(cls, values):
@@ -68,13 +70,18 @@ class SMTPSettings:
             url = urlsplit(public)
             if url.scheme not in {"https", "http"} or not url.hostname or url.username or url.query or url.fragment:
                 raise ValueError("Invalid PUBLIC_APP_URL")
+        interval = int(get("SMTP_MIN_INTERVAL_SECONDS", "300"))
+        if not 60 <= interval <= 86400:
+            raise ValueError("SMTP_MIN_INTERVAL_SECONDS must be between 60 and 86400")
         return cls(host, port, username or None, password or None, _address(get("SMTP_FROM")),
-                   _address(get("QUALITY_EMAIL")), tls, use_ssl, public)
+                   _address(get("QUALITY_EMAIL")), tls, use_ssl, public, interval,
+                   boolean("SMTP_SUMMARY_ONLY"))
 
 
 class SMTPMailer:
     def __init__(self, settings: SMTPSettings):
         self.settings = settings
+        self.min_interval_seconds = settings.min_interval_seconds
 
     def send(self, appeal):
         config = self.settings
@@ -95,7 +102,7 @@ class SMTPMailer:
         if config.public_url:
             text.append("Служба качества: " + config.public_url + "/docs?" + urlencode({"appeal": appeal["id"]})
                         + "#/quality")
-        message.set_content("\n".join(text))
+        message.set_content("\n".join(text[:1] if config.summary_only else text))
 
         connection = None
         sending = False
@@ -136,6 +143,11 @@ def deliver_one(quality):
     now, lease = time(), str(uuid4())
     with quality.store.write() as db:
         db.execute("UPDATE quality_mail SET status='uncertain', lease=NULL WHERE status='sending' AND due<=?", (now,))
+        interval = getattr(quality.mailer, "min_interval_seconds", 0)
+        if interval and db.execute(
+            "SELECT 1 FROM activity WHERE kind='quality_mail' AND instant > ? LIMIT 1", (now - interval,)
+        ).fetchone():
+            return
         row = db.execute("""
             SELECT appeal_id, attempts FROM quality_mail WHERE status IN ('pending','retry') AND due<=?
             ORDER BY due LIMIT 1
@@ -145,6 +157,9 @@ def deliver_one(quality):
         key, attempt = row["appeal_id"], row["attempts"] + 1
         db.execute("UPDATE quality_mail SET status='sending', attempts=?,due=?,lease=? WHERE appeal_id=?",
                    (attempt, now + 120, lease, key))
+        if interval:
+            db.execute("DELETE FROM activity WHERE kind='quality_mail' AND instant <= ?", (now - interval,))
+            db.execute("INSERT INTO activity VALUES (?, 'quality_mail', ?, 0)", (lease, now))
     try:
         quality.mailer.send(quality.detail(key))
     except MailFailed:

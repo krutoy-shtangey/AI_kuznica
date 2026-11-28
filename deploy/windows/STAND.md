@@ -1,6 +1,8 @@
 # Круглосуточный стенд на Windows 10
 
-Команды выполняются из корня проекта в обычном Windows PowerShell. Планировщик запускает две независимые задачи от той же учётной записи Windows, которой принадлежат проект и конфигурация ngrok. Запущенные задачи продолжают работу при закрытии терминала, браузера и Codex.
+Команды выполняются из корня проекта в обычном Windows PowerShell. Для запуска до входа в Windows в локальном stand.json заданы абсолютные пути к подписанному standalone ngrok и к существующему файлу конфигурации агента. Это исключает зависимость от псевдонима Microsoft Store и перенаправления пути настроек в интерактивном сеансе. Токен остаётся в исходном файле агента.
+
+Планировщик запускает две независимые задачи от той же учётной записи Windows, которой принадлежат проект и конфигурация ngrok. Запущенные задачи продолжают работу при закрытии терминала, браузера и Codex.
 
 ## Постоянный Python
 
@@ -43,42 +45,54 @@ Invoke-RestMethod 'http://127.0.0.1:8002/api/health'
 
 Настроены триггер при запуске ОС, один экземпляр, отсутствие ограничения по длительности и перезапуск задачи после сбоя через минуту, до 60 попыток. Uvicorn дополнительно перезапускает существующий supervisor. Если процесс жив, но HTTP завис, используйте ручной перезапуск. Доступ к сети, питание и обновления Windows остаются внешними зависимостями.
 
-## ngrok для жюри
+## Публичный стенд через ngrok
 
-Проверьте закреплённый hostname в **ngrok Dashboard → Domains**. Подготовьте локальный файл `storage/windows/stand.json`, заменив значения домена и адресов на согласованные. Пока оставьте `publicEnabled` равным `false`.
+В `storage/windows/stand.json` разрешена публикация только на `oak-update-dealing.ngrok-free.dev`. Пользовательские страницы и API доступны без OAuth. Панель службы качества, административный API, Swagger и файлы компьютера закрыты через туннель. Каждый диалог по-прежнему требует свой токен. Минутные лимиты и 150 попыток модели за 24 часа общие для стенда. Индексация роботами запрещена.
 
 ```json
 {
-  "publicEnabled": false,
-  "publicHost": "assigned.ngrok-free.app",
-  "judges": ["judge@example.invalid"]
+  "publicEnabled": true,
+  "publicHost": "oak-update-dealing.ngrok-free.dev",
+  "smtpNotifications": false,
+  "ngrokExe": "C:\\path\\to\\ngrok.exe",
+  "ngrokConfig": "C:\\path\\to\\ngrok.yml"
 }
 ```
 
-Агент по умолчанию используется из Microsoft Store той же учётной записи. Если пакет Store не запускается в сеансе без входа, скачайте [standalone ngrok для Windows](https://ngrok.com/download/windows?tab=download) в постоянный каталог и укажите его абсолютный путь в `ngrokExe`. При необходимости укажите абсолютный путь к существующему YAML с токеном в `ngrokConfig`. Для Store логический путь по умолчанию — `%LOCALAPPDATA%\ngrok\ngrok.yml`. Токен хранится в конфигурации агента.
-
-1. Прогоните проверку файла и конфигурации агента без туннеля:
+Для новой установки замените оба пути в локальном файле. Проверка агента и конфигурации без запуска туннеля:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\stand.ps1 Tunnel -Check
 ```
 
-2. Только после согласования передачи регламентов выключите **Full Capture** в Dashboard → Traffic Inspector. В `stand.json` явно включите `publicEnabled`. Перезапустите backend, затем разрешите и запустите задачу туннеля:
+Планировщик запускает `stand.ps1 Tunnel`. Скрипт использует текущую конфигурацию агента, ждёт рабочего backend и запрашивает локально маршруты с публичным Host. Агент запускается после HTTP 200 от `/api/health` и HTTP 403 от `/api/quality/appeals`. `--inspect=false` отключает HTTP-инспекцию агента. Настройки захвата трафика в Dashboard отдельные. Если Full Capture доступен в аккаунте, держите его выключенным.
+
+Для запуска или переноса текущего backend на публичную конфигурацию выполните в PowerShell с правами администратора:
 
 ```powershell
+Set-Location 'D:\КУЗНИЦА\AI_kuznica'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\app.ps1 Stop -Mode retrieval-proxyapi
 Start-ScheduledTask -TaskName 'Reglament AI Backend'
 Enable-ScheduledTask -TaskName 'Reglament AI Tunnel'
 Start-ScheduledTask -TaskName 'Reglament AI Tunnel'
+Get-ScheduledTask -TaskName 'Reglament AI Backend','Reglament AI Tunnel' |
+    Select-Object TaskName,State
 ```
 
-Разовый публичный запуск вместо задачи туннеля выполняет ту же команду с доменом из `stand.json` и обязательной OAuth-политикой:
+Проверьте публичную главную страницу, `/api/health` и `/robots.txt`. Снаружи `/api/quality/appeals`, `/docs` и `/.env` должны вернуть 403. При завершении агента скрипт снова проверяет backend и запускает ngrok через 10 секунд. Если завершился сам PowerShell, перезапуск зависит от настроек задачи в Планировщике. Для запланированной остановки сначала отключите задачу туннеля, затем остановите её.
+
+Для диагностики автозапуска проверьте время фактического выполнения задачи и её код завершения:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\stand.ps1 Tunnel
+Get-ScheduledTaskInfo -TaskName 'Reglament AI Tunnel' |
+    Select-Object LastRunTime,LastTaskResult
 ```
 
-Она вызывает `ngrok http http://127.0.0.1:8002 --url "https://$standHost" --inspect=false --config $agentConfig --traffic-policy-file $policyPath`. Перед этим проверяет, что backend принимает только указанный публичный Host по HTTPS и возвращает 403 на административном маршруте в публичном режиме. OAuth использует согласованный список адресов, а без флага задача завершится без запуска агента. Проверьте разрешённый и посторонний аккаунты, внешний ответ 403 на `/api/quality/appeals`, `/docs` и `/.env`. Служба качества доступна локально с отдельным токеном. Флаг инспекции относится к локальному инспектору, а обработка трафика и настройки хранения на стороне ngrok проверяются отдельно.
+Журнал запуска и завершения агента находится в storage/windows/tunnel-lifecycle.log. После перезагрузки проверьте, что публичный `/api/health` отвечает с `model=proxyapi-qwen`.
+
+### SMTP
+
+SMTP выключен. Для включения подтвердите адрес служебного почтового ящика в локальном `.env`, проверьте настройки TLS и установите `SMTP_MIN_INTERVAL_SECONDS=300`. В `stand.json` задайте `"smtpNotifications": true` и перезапустите задачу backend. В рабочем режиме письмо содержит только идентификатор обращения. Текст обращения читается в локальной панели. Интервал общий для очереди и сохраняется в SQLite между перезапусками, включая попытки повторной отправки. По умолчанию допускается не более одной попытки SMTP за 5 минут.
 
 ## Управление и резервная копия
 
@@ -108,5 +122,5 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\deploy\windows\app.ps1
 
 В Windows 10 откройте **Параметры → Система → Питание и спящий режим**. Для питания от сети установите сон **Никогда**. Выключение дисплея можно оставить. Если включён отдельный таймер гибернации, проверьте его в дополнительных параметрах схемы питания. Брандмауэр, Defender и обновления Windows оставьте включёнными.
 
-[Планировщик Windows](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/register-scheduledtask?view=win10-ps) · [OAuth ngrok](https://ngrok.com/docs/gateway/traffic-policy/examples/oauth-protection) · [HTTP-инспекция ngrok](https://ngrok.com/docs/obs/traffic-inspection/http-requests)
+[Планировщик Windows](https://learn.microsoft.com/en-us/powershell/module/scheduledtasks/register-scheduledtask?view=win10-ps) · [HTTP-инспекция ngrok](https://ngrok.com/docs/obs/traffic-inspection/http-requests)
 
