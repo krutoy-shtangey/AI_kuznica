@@ -8,6 +8,25 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $state = Join-Path $root 'storage\windows'
 $settingsPath = Join-Path $state 'stand.json'
+$tunnelLog = Join-Path $state 'tunnel-lifecycle.log'
+
+function Write-TunnelEvent([string]$Message) {
+    $line = '{0:o} pid={1} {2}' -f [DateTimeOffset]::Now, $PID, $Message
+    Add-Content -LiteralPath $tunnelLog -Value $line -Encoding UTF8
+}
+
+if ($Component -eq 'Tunnel' -and -not $Check) {
+    $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    Write-TunnelEvent "Tunnel runner started in Windows session $sessionId."
+}
+trap {
+    if ($Component -eq 'Tunnel' -and -not $Check) {
+        $line = $_.InvocationInfo.ScriptLineNumber
+        $errorType = $_.Exception.GetType().Name
+        Write-TunnelEvent "Tunnel runner stopped at line $line ($errorType)."
+    }
+    break
+}
 $settings = if (Test-Path -LiteralPath $settingsPath) {
     Get-Content -Raw -Encoding UTF8 -LiteralPath $settingsPath | ConvertFrom-Json
 } else {
@@ -17,17 +36,8 @@ if ($settings.publicEnabled -isnot [bool]) { throw 'stand.json requires boolean 
 $public = $settings.publicEnabled
 $standHost = $settings.publicHost
 if ($public -or ($Check -and $Component -eq 'Tunnel')) {
-    if ($standHost -cnotmatch '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.ngrok(?:-free)?\.(?:app|dev)$') {
-        throw 'Set publicHost to the exact assigned ngrok hostname, without scheme or path.'
-    }
-    if ($settings.judges -isnot [array] -or $settings.judges.Count -eq 0) {
-        throw 'Set judges to a nonempty array of approved OAuth email addresses.'
-    }
-    foreach ($email in $settings.judges) {
-        if ($email -isnot [string] -or $email -cnotmatch '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$' -or
-            $email -match '@(?:example\.(?:com|net|org|invalid)|.*\.invalid)$') {
-            throw 'Replace example addresses with approved judges before using the tunnel.'
-        }
+    if ($standHost -cne 'oak-update-dealing.ngrok-free.dev') {
+        throw 'Public access is restricted to oak-update-dealing.ngrok-free.dev.'
     }
 }
 
@@ -45,7 +55,11 @@ assert "codex-runtimes" not in str(Path(sys.base_prefix).resolve()).lower()
     if ($Check) { Write-Output 'Permanent backend interpreter is ready.'; return }
     $env:REGLAMENT_ALLOW_PUBLIC = if ($public) { '1' } else { '0' }
     $env:REGLAMENT_PUBLIC_HOST = if ($public) { $standHost } else { '' }
-    $env:SMTP_ENABLED = '0'
+    if ($null -ne $settings.smtpNotifications -and $settings.smtpNotifications -isnot [bool]) {
+        throw 'stand.json smtpNotifications must be a boolean.'
+    }
+    $env:SMTP_ENABLED = if ($settings.smtpNotifications -eq $true) { '1' } else { '0' }
+    $env:SMTP_SUMMARY_ONLY = '1'
     & (Join-Path $PSScriptRoot 'app.ps1') Run -Mode retrieval-proxyapi -Python $python
     return
 }
@@ -65,28 +79,17 @@ if (-not [IO.Path]::IsPathRooted($ngrok) -or -not [IO.Path]::IsPathRooted($agent
     throw 'ngrokExe and ngrokConfig must be absolute paths.'
 }
 & $ngrok config check --config $agentConfig
-if ($LASTEXITCODE) { throw 'ngrok configuration check failed.' }
-
-$approved = ($settings.judges | ForEach-Object { "'" + $_ + "'" }) -join ', '
-$policy = @{
-    on_http_request = @(
-        @{actions = @(@{type = 'oauth'; config = @{provider = 'google'}})}
-        @{
-            expressions = @("!(actions.ngrok.oauth.identity.email in [$approved])")
-            actions = @(@{type = 'deny'; config = @{status_code = 403}})
-        }
-    )
+if ($LASTEXITCODE) {
+    if (-not $Check) { Write-TunnelEvent "Agent configuration check failed ($LASTEXITCODE)." }
+    throw 'ngrok configuration check failed.'
 }
+
 if ($Check) {
-    Write-Output "OAuth allowlist validated locally for https://$standHost. No tunnel started."
+    Write-Output "Public hostname and agent validated locally for https://$standHost. No tunnel started."
     return
 }
-$policyPath = Join-Path $state 'stand-ngrok-policy.json'
-[IO.File]::WriteAllText($policyPath, ($policy | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
 $python = Join-Path $state 'runtime\venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Prepare the permanent Python environment first.' }
-$deadline = [DateTime]::UtcNow.AddMinutes(3)
-$ready = $false
 $probe = @'
 from http.client import HTTPConnection
 import json
@@ -108,13 +111,21 @@ except OSError:
 finally:
     conn.close()
 '@
-do {
+while ($true) {
+    $current = Get-Content -Raw -Encoding UTF8 -LiteralPath $settingsPath | ConvertFrom-Json
+    if ($current.publicEnabled -isnot [bool] -or -not $current.publicEnabled -or $current.publicHost -cne $standHost) {
+        Write-Output 'Public stand disabled or hostname changed.'
+        return
+    }
     $probe | & $python -I -B - $standHost
-    $ready = $LASTEXITCODE -eq 0
-    if (-not $ready) { Start-Sleep -Seconds 2 }
-} until ($ready -or [DateTime]::UtcNow -ge $deadline)
-if (-not $ready) { throw 'The backend did not confirm the public host and blocked admin routes. Task Scheduler can retry.' }
-
-& $ngrok http 'http://127.0.0.1:8002' --url "https://$standHost" --inspect=false --config $agentConfig --traffic-policy-file $policyPath
-throw "ngrok exited ($LASTEXITCODE). Task Scheduler can retry."
+    if ($LASTEXITCODE -eq 0) {
+        Write-TunnelEvent 'Starting ngrok after backend and admin-route checks passed.'
+        & $ngrok http 'http://127.0.0.1:8002' --url "https://$standHost" --inspect=false --config $agentConfig
+        Write-TunnelEvent "ngrok exited ($LASTEXITCODE)."
+        Write-Warning "ngrok exited ($LASTEXITCODE). Retrying in 10 seconds."
+        Start-Sleep -Seconds 10
+    } else {
+        Start-Sleep -Seconds 5
+    }
+}
 

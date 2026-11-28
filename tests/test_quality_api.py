@@ -150,6 +150,21 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(len(mailbox.messages), 1)
         self.assertEqual(self.detail(client, card)["notification"]["status"], "uncertain")
 
+    def test_mail_interval_is_shared_by_distinct_appeals(self):
+        mailbox = Mailbox()
+        mailbox.min_interval_seconds = 300
+        client, _, app = self.new(mailer=mailbox)
+        first, second = self.create_card(client), self.create_card(client)
+        deliver_one(app.state.quality)
+        deliver_one(app.state.quality)
+        self.assertEqual(len(mailbox.messages), 1)
+        statuses = [self.detail(client, card)["notification"]["status"] for card in (first, second)]
+        self.assertCountEqual(statuses, ["sent", "pending"])
+        with app.state.quality.store.write() as db:
+            db.execute("UPDATE activity SET instant=instant-301 WHERE kind='quality_mail'")
+        deliver_one(app.state.quality)
+        self.assertEqual(len(mailbox.messages), 2)
+
     def test_draft_is_saved_and_invisible(self):
         client, model, _ = self.new()
         card = self.create_card(client)
