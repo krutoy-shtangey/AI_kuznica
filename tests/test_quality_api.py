@@ -244,6 +244,35 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.json()["code"], "source_review_required")
 
+    def test_published_revision_answers_new_question_among_loosely_related_regulations(self):
+        client, model, app = self.new()
+        card = self.create_card(client)
+        self.set_draft(client, card)
+        self.action(client, card, "approve")
+        updated = "Жетоны на учебный телескоп выдаёт кассир павильона."
+        self.set_draft(client, card, updated)
+        self.assertEqual(self.action(client, card, "approve")["publication"]["revision"], 2)
+
+        related = source("21", "Жетоны на парковку выдаёт сотрудник у входа.", "tech")
+        retrieval = app.state.quality.retrieval
+        search = retrieval.search_documents
+        app.state.agent.require_focus = True
+        reply = draft("ANSWER", self.evidence(card, updated)).model_copy(
+            update={"question_focus": "учебный телескоп"},
+        )
+        model.replies = iter([reply, reply])
+        with patch.object(retrieval, "search_documents", side_effect=lambda *args, **kwargs: [
+            related, *search(*args, **kwargs),
+        ]):
+            dialogue = self.dialogue(client)
+            for target in (dialogue, self.dialogue(client)):
+                result = self.send(client, target)
+                self.assertIn(updated, result["result"]["text"])
+                self.assertNotIn(EXPERT_TEXT, result["result"]["text"])
+                self.assertEqual([(item["source_type"], item["revision"]) for item in result["sources"]],
+                                 [("expert_answer", 2)])
+                self.assertIn(related.source_id, {item["source_id"] for item in model.calls[-1][1]["sources"]})
+
     def test_missing_draft_scope_inherits_appeal_scope(self):
         client, _, _ = self.new()
         dialog = self.dialogue(client)

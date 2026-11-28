@@ -101,6 +101,10 @@ CONFLICT: если два пункта в одной области дают р�
 или задай null. Если различие вызвано подразделением или этапом, задай CLARIFY.
 Разъяснение службы качества не отменяет регламент. При несовместимости выбери CONFLICT и процитируй оба.
 Если разъяснение дополняет относящийся к вопросу пункт регламента, процитируй оба.
+Если утверждённое разъяснение само отвечает на вопрос, используй его как самостоятельный
+источник. Общие слова в регламенте о соседней теме не требуют ссылки на него. Проверь
+также общие правила, которые распространяются на этот случай: если они противоречат
+разъяснению, верни CONFLICT, даже если они описывают предмет другими словами.
 NO_ANSWER: если ответ можно лишь предположить, evidence — пустой список.
 Вне CLARIFY поля field и question — null. Учитывай именно текущий вопрос.
 Перед ANSWER проверь, что основное правило стоит первым и не потеряно ни одно
@@ -590,18 +594,21 @@ class Agent:
                 if options and not getattr(state, field):
                     return self._clarify(dialogue_id, state, field, _scope_question(field, options), metrics)
 
-        # A matching official provision cannot be silently bypassed by choosing only an explanation.
+        # Similar search hits are insufficient to establish that an official provision
+        # covers this question. The shared subject must include the terms that narrow it.
         if kind is AgentResultType.ANSWER and all(
             item.source.source_type is SourceType.EXPERT_ANSWER for item in selected.values()
         ):
-            question_terms = context_terms(state.question or "")
-            expert_terms = set().union(*(context_terms(item.text) for item in selected.values()))
-            if any(
-                item.source.source_type is SourceType.REGULATION
-                and len(context_terms(item.text) & question_terms & expert_terms) >= 2
-                for item in excerpts.values()
-            ):
-                raise AgentFailure("source_review_required")
+            question_terms = _subject_terms(state.question or "")
+            for expert in selected.values():
+                subject = question_terms & _subject_terms(expert.text)
+                if len(subject) >= 2 and any(
+                    item.source.source_type is SourceType.REGULATION
+                    and _scopes_overlap(item.source, expert.source)
+                    and subject <= _subject_terms(item.text)
+                    for item in excerpts.values()
+                ):
+                    raise AgentFailure("source_review_required")
 
         structured = kind is AgentResultType.ANSWER and len(selected) > 1 and any(key in roles for key in selected)
         if structured:
